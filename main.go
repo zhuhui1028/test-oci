@@ -2034,7 +2034,7 @@ func getInstancePublicIps(clients *OciClients, instanceId *string) (ips []string
 				continue
 			}
 			if ins.LifecycleState == core.InstanceLifecycleStateTerminating || ins.LifecycleState == core.InstanceLifecycleStateTerminated {
-				err = errors.New("实例已终止�")
+				err = errors.New("实例已终止😔")
 				return
 			}
 		}
@@ -3054,7 +3054,18 @@ func (app *App) checkAllTenantsActivity() {
 
 			_, err = identityClient.GetTenancy(ctx, identity.GetTenancyRequest{TenancyId: &oracleConfig.Tenancy})
 			if err != nil {
-				resultsChan <- TenantStatus{Name: sec.Name(), Status: "\033[1;31m无效\033[0m", Message: err.Error()}
+				var errMsg string
+				// 检查是否为 OCI 服务错误
+				if serviceError, ok := common.IsServiceError(err); ok {
+					errMsg = fmt.Sprintf("%s (状态码: %d, 服务码: %s)",
+						serviceError.GetMessage(),
+						serviceError.GetHTTPStatusCode(),
+						serviceError.GetCode())
+				} else {
+					// 其他错误 (例如文件未找到, 网络问题)
+					errMsg = err.Error()
+				}
+				resultsChan <- TenantStatus{Name: sec.Name(), Status: "\033[1;31m无效\033[0m", Message: errMsg}
 			} else {
 				resultsChan <- TenantStatus{Name: sec.Name(), Status: "\033[1;32m有效\033[0m", Message: "凭证有效"}
 			}
