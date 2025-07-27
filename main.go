@@ -16,6 +16,8 @@
   https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/PrivateIp/
   公共IP
   https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/PublicIp/
+  IPv6
+  https://docs.oracle.com/en-us/iaas/api/#/en/iaas/20160918/Ipv6/
   用户
   https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/User/
   监控
@@ -138,6 +140,13 @@ type App struct {
 	availabilityDomains []identity.AvailabilityDomain
 	oracleSections      []*ini.Section
 	instanceBaseSection *ini.Section
+}
+
+// TenantStatus holds the result of a single tenant's credential check.
+type TenantStatus struct {
+	Name    string
+	Status  string
+	Message string
 }
 
 func main() {
@@ -315,8 +324,9 @@ func (app *App) showMainMenu() {
 		fmt.Fprintln(w, "4.\t网络管理")
 		fmt.Fprintln(w, "5.\t管理员管理")
 		fmt.Fprintln(w, "6.\t租户与用户信息")
+		fmt.Fprintln(w, "7.\t租户管理 (凭证检查)")
 		w.Flush()
-		fmt.Print("\n请输入序号进入相关操作 (输入 'q' 或直接回车返回上一级): ")
+		fmt.Print("\n请输入序号进入相关操作 (输入 'q' 或直接回车返回): ")
 		var input string
 		fmt.Scanln(&input)
 		if strings.EqualFold(input, "q") || input == "" {
@@ -346,6 +356,8 @@ func (app *App) showMainMenu() {
 			app.manageAdmins()
 		case 6:
 			app.manageTenantAndUser()
+		case 7:
+			app.manageTenants()
 		default:
 			fmt.Println("\033[1;31m无效的输入。\033[0m")
 		}
@@ -504,6 +516,7 @@ func (app *App) instanceDetails(instanceId *string) {
 			return
 		}
 		var publicIps = make([]string, 0)
+		var ipv6s = make([]string, 0)
 		var subnetName string
 
 		if len(vnics) > 0 {
@@ -514,6 +527,13 @@ func (app *App) instanceDetails(instanceId *string) {
 				}
 				if vnic.PublicIp != nil {
 					publicIps = append(publicIps, *vnic.PublicIp)
+				}
+				// 获取 IPv6
+				ipv6List, err := listIpv6s(app.clients.Network, vnic.Id)
+				if err == nil {
+					for _, ipv6 := range ipv6List {
+						ipv6s = append(ipv6s, *ipv6.IpAddress)
+					}
 				}
 			}
 			// 获取子网信息
@@ -526,6 +546,10 @@ func (app *App) instanceDetails(instanceId *string) {
 		if strPublicIps == "" {
 			strPublicIps = "N/A"
 		}
+		strIpv6s := strings.Join(ipv6s, ", ")
+		if strIpv6s == "" {
+			strIpv6s = "N/A"
+		}
 
 		fmt.Printf("\n\033[1;32m实例详细信息\033[0m \n(当前账号: %s)\n\n", app.oracleSectionName)
 		w := new(tabwriter.Writer)
@@ -533,6 +557,7 @@ func (app *App) instanceDetails(instanceId *string) {
 		fmt.Fprintf(w, "名称:\t%s\n", *instance.DisplayName)
 		fmt.Fprintf(w, "状态:\t%s\n", getInstanceState(instance.LifecycleState))
 		fmt.Fprintf(w, "公共IPv4:\t%s\n", strPublicIps)
+		fmt.Fprintf(w, "公共IPv6:\t%s\n", strIpv6s)
 		fmt.Fprintf(w, "可用性域:\t%s\n", *instance.AvailabilityDomain)
 		fmt.Fprintf(w, "子网:\t%s\n", subnetName)
 		fmt.Fprintf(w, "开机时间:\t%s\n", instance.TimeCreated.Format(timeLayout))
@@ -551,7 +576,7 @@ func (app *App) instanceDetails(instanceId *string) {
 
 		fmt.Println("--------------------")
 		fmt.Printf("\n\033[1;32m1: %s   2: %s   3: %s   4: %s   5: %s\033[0m\n", "启动", "停止", "重启", "终止", "更换IPv4")
-		fmt.Printf("\033[1;32m6: %s   7: %s   8: %s   9: %s\033[0m\n", "升级/降级", "修改名称", "Agent插件配置", "查看流量")
+		fmt.Printf("\033[1;32m6: %s   7: %s   8: %s   9: %s   10: %s\033[0m\n", "升级/降级", "修改名称", "Agent插件配置", "查看流量", "添加IPv6")
 		var input string
 		var num int
 		fmt.Print("\n请输入需要执行操作的序号 (输入 'q' 或直接回车返回): ")
@@ -683,6 +708,8 @@ func (app *App) instanceDetails(instanceId *string) {
 
 		case 9:
 			app.viewInstanceTraffic(instance.Id)
+		case 10:
+			app.addIpv6ToInstance(vnics)
 
 		default:
 			app.listInstances()
@@ -2007,7 +2034,7 @@ func getInstancePublicIps(clients *OciClients, instanceId *string) (ips []string
 				continue
 			}
 			if ins.LifecycleState == core.InstanceLifecycleStateTerminating || ins.LifecycleState == core.InstanceLifecycleStateTerminated {
-				err = errors.New("实例已终止😔")
+				err = errors.New("实例已终止�")
 				return
 			}
 		}
@@ -2318,7 +2345,7 @@ func command(cmd string) {
 }
 
 // =================================================================
-// ==================== 新增功能实现 ===============================
+// ==================== 新增/优化功能实现 ==========================
 // =================================================================
 
 // -------------------- 管理员管理 --------------------
@@ -2596,13 +2623,17 @@ func (app *App) listAllSubnets() {
 	fmt.Printf("\n\033[1;32m子网列表\033[0m\n")
 	w := new(tabwriter.Writer)
 	w.Init(os.Stdout, 0, 8, 2, '\t', 0)
-	fmt.Fprintln(w, "序号\t名称\tCIDR\t状态\t类型")
+	fmt.Fprintln(w, "序号\t名称\tCIDR\tIPv6 CIDR\t状态\t类型")
 	for i, subnet := range subnets {
 		subnetType := "区域性"
 		if subnet.AvailabilityDomain != nil && *subnet.AvailabilityDomain != "" {
 			subnetType = "AD特定"
 		}
-		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", i+1, *subnet.DisplayName, *subnet.CidrBlock, subnet.LifecycleState, subnetType)
+		ipv6Cidr := "N/A"
+		if subnet.Ipv6CidrBlock != nil {
+			ipv6Cidr = *subnet.Ipv6CidrBlock
+		}
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\n", i+1, *subnet.DisplayName, *subnet.CidrBlock, ipv6Cidr, subnet.LifecycleState, subnetType)
 	}
 	w.Flush()
 	// TODO: Add modification logic if needed
@@ -2683,7 +2714,7 @@ func getVcn(c core.VirtualNetworkClient, vcnId *string) (core.Vcn, error) {
 	return resp.Vcn, err
 }
 
-// -------------------- 流量查看 --------------------
+// -------------------- 流量查看 (优化) --------------------
 func (app *App) viewInstanceTraffic(instanceId *string) {
 	for {
 		fmt.Printf("\n\033[1;32m查看实例流量\033[0m\n")
@@ -2743,7 +2774,6 @@ func (app *App) viewInstanceTraffic(instanceId *string) {
 func (app *App) queryTraffic(instanceId *string, startTime, endTime time.Time, resolution string) {
 	fmt.Println("正在查询流量数据，请稍候...")
 	namespace := "oci_computeagent"
-	resourceGroup := "instance_metrics"
 	// Metrics: NetworksBytesIn, NetworksBytesOut
 	queryIn := fmt.Sprintf("NetworksBytesIn[1m]{resourceId = \"%s\"}.sum()", *instanceId)
 	queryOut := fmt.Sprintf("NetworksBytesOut[1m]{resourceId = \"%s\"}.sum()", *instanceId)
@@ -2751,26 +2781,22 @@ func (app *App) queryTraffic(instanceId *string, startTime, endTime time.Time, r
 	var totalIn, totalOut float64
 
 	// Get Inbound Traffic
-	inResp, err := getMetrics(app.clients.Monitoring, &app.oracleConfig.Tenancy, namespace, resourceGroup, queryIn, startTime, endTime, resolution)
+	inResp, err := getMetrics(app.clients.Monitoring, &app.oracleConfig.Tenancy, namespace, queryIn, startTime, endTime, resolution)
 	if err != nil {
 		printlnErr("获取入站流量失败", err.Error())
-	} else {
-		for _, item := range inResp.Items {
-			for _, dp := range item.AggregatedDatapoints {
-				totalIn += *dp.Value
-			}
+	} else if len(inResp.Items) > 0 {
+		for _, dp := range inResp.Items[0].AggregatedDatapoints {
+			totalIn += *dp.Value
 		}
 	}
 
 	// Get Outbound Traffic
-	outResp, err := getMetrics(app.clients.Monitoring, &app.oracleConfig.Tenancy, namespace, resourceGroup, queryOut, startTime, endTime, resolution)
+	outResp, err := getMetrics(app.clients.Monitoring, &app.oracleConfig.Tenancy, namespace, queryOut, startTime, endTime, resolution)
 	if err != nil {
 		printlnErr("获取出站流量失败", err.Error())
-	} else {
-		for _, item := range outResp.Items {
-			for _, dp := range item.AggregatedDatapoints {
-				totalOut += *dp.Value
-			}
+	} else if len(outResp.Items) > 0 {
+		for _, dp := range outResp.Items[0].AggregatedDatapoints {
+			totalOut += *dp.Value
 		}
 	}
 
@@ -2780,16 +2806,15 @@ func (app *App) queryTraffic(instanceId *string, startTime, endTime time.Time, r
 	fmt.Printf("总计使用流量:           %s\n", formatBytes(totalIn+totalOut))
 }
 
-func getMetrics(c monitoring.MonitoringClient, tenancyId *string, namespace, resourceGroup, query string, startTime, endTime time.Time, resolution string) (monitoring.SummarizeMetricsDataResponse, error) {
+func getMetrics(c monitoring.MonitoringClient, tenancyId *string, namespace, query string, startTime, endTime time.Time, resolution string) (monitoring.SummarizeMetricsDataResponse, error) {
 	req := monitoring.SummarizeMetricsDataRequest{
 		CompartmentId: tenancyId,
 		SummarizeMetricsDataDetails: monitoring.SummarizeMetricsDataDetails{
-			Namespace:     &namespace,
-			ResourceGroup: &resourceGroup,
-			Query:         &query,
-			StartTime:     &common.SDKTime{Time: startTime},
-			EndTime:       &common.SDKTime{Time: endTime},
-			Resolution:    &resolution,
+			Namespace:  &namespace,
+			Query:      &query,
+			StartTime:  &common.SDKTime{Time: startTime},
+			EndTime:    &common.SDKTime{Time: endTime},
+			Resolution: &resolution,
 		},
 	}
 	return c.SummarizeMetricsData(ctx, req)
@@ -2900,3 +2925,159 @@ func (app *App) updateMyRecoveryEmail() {
 	fmt.Println("\033[1;32m恢复邮箱更新成功！\033[0m")
 }
 
+// -------------------- 新增：IPv6 添加能力 --------------------
+func (app *App) addIpv6ToInstance(vnics []core.Vnic) {
+	if len(vnics) == 0 {
+		fmt.Printf("\033[1;31m实例已终止或获取实例VNIC失败，请稍后重试.\033[0m\n")
+		return
+	}
+
+	var primaryVnic core.Vnic
+	for _, v := range vnics {
+		if *v.IsPrimary {
+			primaryVnic = v
+			break
+		}
+	}
+	if primaryVnic.Id == nil {
+		printlnErr("未找到主网卡", "")
+		return
+	}
+
+	fmt.Printf("确定要为实例主网卡添加一个IPv6地址吗？(输入 y 并回车): ")
+	var confirmInput string
+	fmt.Scanln(&confirmInput)
+	if !strings.EqualFold(confirmInput, "y") {
+		fmt.Println("操作已取消。")
+		return
+	}
+
+	fmt.Println("正在为网卡添加IPv6地址...")
+	req := core.CreateIpv6Request{
+		CreateIpv6Details: core.CreateIpv6Details{
+			VnicId: primaryVnic.Id,
+		},
+	}
+	resp, err := app.clients.Network.CreateIpv6(ctx, req)
+	if err != nil {
+		printlnErr("添加IPv6地址失败", err.Error())
+		return
+	}
+
+	fmt.Printf("\033[1;32m成功为实例添加IPv6地址: %s\033[0m\n", *resp.Ipv6.IpAddress)
+	fmt.Println("注意：您可能需要在操作系统内部配置网络以使用此IPv6地址。")
+}
+
+func listIpv6s(c core.VirtualNetworkClient, vnicId *string) ([]core.Ipv6, error) {
+	req := core.ListIpv6sRequest{VnicId: vnicId}
+	resp, err := c.ListIpv6s(ctx, req)
+	return resp.Items, err
+}
+
+// -------------------- 租户管理 (凭证检查) --------------------
+func (app *App) manageTenants() {
+	for {
+		fmt.Printf("\n\033[1;32m租户管理 (凭证检查)\033[0m \n(当前账号: %s)\n\n", app.oracleSectionName)
+		fmt.Println("1. 检查当前租户凭证")
+		fmt.Println("2. 一键检查所有租户凭证")
+		fmt.Print("请输入序号 (输入 'q' 或直接回车返回): ")
+
+		var input string
+		fmt.Scanln(&input)
+		if input == "" || strings.EqualFold(input, "q") {
+			return
+		}
+
+		num, _ := strconv.Atoi(input)
+		switch num {
+		case 1:
+			app.checkCurrentTenantActivity()
+		case 2:
+			app.checkAllTenantsActivity()
+		default:
+			fmt.Println("\033[1;31m输入无效\033[0m")
+		}
+	}
+}
+
+func (app *App) checkCurrentTenantActivity() {
+	fmt.Println("正在检查当前租户凭证和活动状态...")
+	req := identity.GetTenancyRequest{TenancyId: &app.oracleConfig.Tenancy}
+	resp, err := app.clients.Identity.GetTenancy(ctx, req)
+	if err != nil {
+		printlnErr("租户凭证无效或API调用失败", err.Error())
+		fmt.Println("请检查您的 oci-help.ini 配置文件中的 tenancy, user, fingerprint, region 和 key_file 是否正确。")
+		return
+	}
+
+	fmt.Printf("\n\033[1;32m当前租户凭证有效！\033[0m\n")
+	w := new(tabwriter.Writer)
+	w.Init(os.Stdout, 0, 8, 2, '\t', 0)
+	fmt.Fprintf(w, "租户名称:\t%s\n", *resp.Tenancy.Name)
+	fmt.Fprintf(w, "租户ID:\t%s\n", *resp.Tenancy.Id)
+	fmt.Fprintf(w, "主区域:\t%s\n", *resp.Tenancy.HomeRegionKey)
+	w.Flush()
+	fmt.Println("\n按回车键返回...")
+	fmt.Scanln()
+}
+
+func (app *App) checkAllTenantsActivity() {
+	fmt.Println("正在一键检查所有租户的凭证...")
+
+	var wg sync.WaitGroup
+	resultsChan := make(chan TenantStatus, len(app.oracleSections))
+
+	for _, section := range app.oracleSections {
+		wg.Add(1)
+		go func(sec *ini.Section) {
+			defer wg.Done()
+
+			var oracleConfig Oracle
+			err := sec.MapTo(&oracleConfig)
+			if err != nil {
+				resultsChan <- TenantStatus{Name: sec.Name(), Status: "\033[1;31m无效\033[0m", Message: "配置文件解析失败"}
+				return
+			}
+
+			provider, err := getProvider(oracleConfig)
+			if err != nil {
+				resultsChan <- TenantStatus{Name: sec.Name(), Status: "\033[1;31m无效\033[0m", Message: "获取Provider失败: " + err.Error()}
+				return
+			}
+
+			identityClient, err := identity.NewIdentityClientWithConfigurationProvider(provider)
+			if err != nil {
+				resultsChan <- TenantStatus{Name: sec.Name(), Status: "\033[1;31m无效\033[0m", Message: "创建IdentityClient失败: " + err.Error()}
+				return
+			}
+			setProxyOrNot(&identityClient.BaseClient)
+
+			_, err = identityClient.GetTenancy(ctx, identity.GetTenancyRequest{TenancyId: &oracleConfig.Tenancy})
+			if err != nil {
+				resultsChan <- TenantStatus{Name: sec.Name(), Status: "\033[1;31m无效\033[0m", Message: err.Error()}
+			} else {
+				resultsChan <- TenantStatus{Name: sec.Name(), Status: "\033[1;32m有效\033[0m", Message: "凭证有效"}
+			}
+		}(section)
+	}
+
+	wg.Wait()
+	close(resultsChan)
+
+	var results []TenantStatus
+	for res := range resultsChan {
+		results = append(results, res)
+	}
+
+	fmt.Printf("\n\033[1;32m所有租户凭证检查结果\033[0m\n")
+	w := new(tabwriter.Writer)
+	w.Init(os.Stdout, 0, 8, 2, '\t', 0)
+	fmt.Fprintln(w, "租户名称\t状态\t信息")
+	fmt.Fprintln(w, "--------\t----\t----")
+	for _, res := range results {
+		fmt.Fprintf(w, "%s\t%s\t%s\n", res.Name, res.Status, res.Message)
+	}
+	w.Flush()
+	fmt.Println("\n按回车键返回...")
+	fmt.Scanln()
+}
