@@ -38,19 +38,20 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"math"
 	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"text/tabwriter"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/core"
 	"github.com/oracle/oci-go-sdk/v65/example/helpers"
@@ -74,9 +75,13 @@ var (
 		cmd            string
 		sendMessageUrl string
 		editMessageUrl string
+		getUpdatesUrl  string
 		each           bool
+		lastUpdateId   int
 	}
-	ctx = context.Background()
+	ctx         = context.Background()
+	cfg         *ini.File
+	taskManager *TaskManager // 新增: 全局任务管理器
 )
 
 // OCI configuration for a single account
@@ -150,24 +155,145 @@ type TenantStatus struct {
 	Message string
 }
 
+// ############# Telegram Bot API Structures #############
+type TgUpdate struct {
+	UpdateId      int            `json:"update_id"`
+	Message       *TgMessage     `json:"message"`
+	CallbackQuery *CallbackQuery `json:"callback_query"`
+}
+
+type TgMessage struct {
+	MessageId int    `json:"message_id"`
+	Text      string `json:"text"`
+	Chat      struct {
+		Id int64 `json:"id"`
+	} `json:"chat"`
+	From struct {
+		Id int64 `json:"id"`
+	} `json:"from"`
+}
+
+type CallbackQuery struct {
+	Id      string     `json:"id"`
+	From    struct {
+		Id int64 `json:"id"`
+	} `json:"from"`
+	Message *TgMessage `json:"message"`
+	Data    string     `json:"data"`
+}
+
+type InlineKeyboardMarkup struct {
+	InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"`
+}
+
+type InlineKeyboardButton struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data"`
+}
+
+// ############# Task Management Structures #############
+type CreationTask struct {
+	ID                   string
+	TenantName           string
+	InstanceTemplate     string
+	Status               string
+	StartTime            time.Time
+	Attempts             int32
+	SuccessCount         int32
+	TotalCount           int32
+	cancelFunc           context.CancelFunc
+	mu                   sync.RWMutex
+	LastMessage          string
+	LastMessageTimestamp time.Time
+}
+
+func (t *CreationTask) UpdateStatus(status string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Status = status
+}
+
+func (t *CreationTask) GetStatus() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return fmt.Sprintf("任务ID: `%s`\n租户: %s\n模版: %s\n状态: %s\n进度: %d/%d\n尝试次数: %d\n运行时长: %s",
+		t.ID, t.TenantName, t.InstanceTemplate, t.Status, t.SuccessCount, t.TotalCount, t.Attempts, fmtDuration(time.Since(t.StartTime)))
+}
+
+type TaskManager struct {
+	mu    sync.Mutex
+	tasks map[string]*CreationTask
+}
+
+func NewTaskManager() *TaskManager {
+	return &TaskManager{
+		tasks: make(map[string]*CreationTask),
+	}
+}
+
+func (tm *TaskManager) Add(task *CreationTask) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.tasks[task.ID] = task
+}
+
+func (tm *TaskManager) Get(id string) (*CreationTask, bool) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	task, ok := tm.tasks[id]
+	return task, ok
+}
+
+func (tm *TaskManager) Remove(id string) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	delete(tm.tasks, id)
+}
+
+func (tm *TaskManager) List() []*CreationTask {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	var tasks []*CreationTask
+	for _, task := range tm.tasks {
+		tasks = append(tasks, task)
+	}
+	// Sort by start time
+	sort.Slice(tasks, func(i, j int) bool {
+		return tasks[i].StartTime.Before(tasks[j].StartTime)
+	})
+	return tasks
+}
+
 func main() {
 	var configFilePath string
+	var botMode bool
 	flag.StringVar(&configFilePath, "config", defConfigFilePath, "配置文件路径")
-	flag.StringVar(&configFilePath, "c", defConfigFilePath, "配置文件路径")
+	flag.StringVar(&configFilePath, "c", defConfigFilePath, "配置文件路径 (简写)")
+	flag.BoolVar(&botMode, "bot", false, "以Telegram Bot模式启动")
 	flag.Parse()
 
-	cfg, err := ini.Load(configFilePath)
+	var err error
+	cfg, err = ini.Load(configFilePath)
 	helpers.FatalIfError(err)
 
 	loadAppConfig(cfg)
 	rand.Seed(time.Now().UnixNano())
 
-	app := &App{}
-	app.loadOracleSections(cfg)
-	app.run()
+	if botMode {
+		if appConfig.token == "" {
+			fmt.Println("\033[1;31m错误: Bot模式需要设置Telegram token。\033[0m")
+			os.Exit(1)
+		}
+		taskManager = NewTaskManager() // Initialize the task manager
+		fmt.Println("以Telegram Bot模式启动...")
+		startBot()
+	} else {
+		app := &App{}
+		app.loadOracleSections(cfg)
+		app.run()
+	}
 }
 
-// loadAppConfig loads general application settings from the INI file.
 func loadAppConfig(cfg *ini.File) {
 	defSec := cfg.Section(ini.DefaultSection)
 	appConfig.proxy = defSec.Key("proxy").Value()
@@ -175,11 +301,14 @@ func loadAppConfig(cfg *ini.File) {
 	appConfig.chat_id = defSec.Key("chat_id").Value()
 	appConfig.cmd = defSec.Key("cmd").Value()
 	appConfig.each, _ = defSec.Key("EACH").Bool()
-	appConfig.sendMessageUrl = "https://api.telegram.org/bot" + appConfig.token + "/sendMessage"
-	appConfig.editMessageUrl = "https://api.telegram.org/bot" + appConfig.token + "/editMessageText"
+	if appConfig.token != "" {
+		apiBase := "https://api.telegram.org/bot" + appConfig.token
+		appConfig.sendMessageUrl = apiBase + "/sendMessage"
+		appConfig.editMessageUrl = apiBase + "/editMessageText"
+		appConfig.getUpdatesUrl = apiBase + "/getUpdates"
+	}
 }
 
-// loadOracleSections finds and loads all valid OCI account sections from the INI file.
 func (app *App) loadOracleSections(cfg *ini.File) {
 	app.oracleSections = []*ini.Section{}
 	for _, sec := range cfg.Sections() {
@@ -198,7 +327,6 @@ func (app *App) loadOracleSections(cfg *ini.File) {
 	app.instanceBaseSection = cfg.Section("INSTANCE")
 }
 
-// run starts the main application loop.
 func (app *App) run() {
 	for {
 		oracleSection, exit := app.selectOracleAccount()
@@ -216,7 +344,557 @@ func (app *App) run() {
 	}
 }
 
-// selectOracleAccount prompts the user to select an OCI account to manage.
+// ############# Telegram Bot Core Logic #############
+
+func getTgClient() *http.Client {
+	client := &http.Client{Timeout: 40 * time.Second}
+	if appConfig.proxy != "" {
+		proxyURL, err := url.Parse(appConfig.proxy)
+		if err != nil {
+			printlnErr("代理URL解析失败", err.Error())
+		} else {
+			client.Transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
+		}
+	}
+	return client
+}
+
+func startBot() {
+	fmt.Printf("Bot正在监听来自Chat ID: %s 的消息...\n", appConfig.chat_id)
+	for {
+		updates, err := getUpdates()
+		if err != nil {
+			printlnErr("获取TG更新失败", err.Error())
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		for _, update := range updates {
+			handleUpdate(update)
+			appConfig.lastUpdateId = update.UpdateId + 1
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func getUpdates() ([]TgUpdate, error) {
+	client := getTgClient()
+	resp, err := client.Get(fmt.Sprintf("%s?offset=%d&timeout=30", appConfig.getUpdatesUrl, appConfig.lastUpdateId))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var updateResp struct {
+		Ok          bool       `json:"ok"`
+		Result      []TgUpdate `json:"result"`
+		ErrorCode   int        `json:"error_code"`
+		Description string     `json:"description"`
+	}
+
+	err = json.Unmarshal(body, &updateResp)
+	if err != nil {
+		return nil, fmt.Errorf("解析Telegram响应失败: %w. 响应内容: %s", err, string(body))
+	}
+
+	if !updateResp.Ok {
+		return nil, fmt.Errorf("Telegram API返回错误 (代码: %d): %s", updateResp.ErrorCode, updateResp.Description)
+	}
+
+	return updateResp.Result, nil
+}
+
+func handleUpdate(update TgUpdate) {
+	var incomingChatId int64
+	configChatId, _ := strconv.ParseInt(appConfig.chat_id, 10, 64)
+
+	if update.Message != nil {
+		incomingChatId = update.Message.Chat.Id
+	} else if update.CallbackQuery != nil {
+		incomingChatId = update.CallbackQuery.Message.Chat.Id
+	}
+
+	if configChatId != 0 && incomingChatId != configChatId {
+		fmt.Printf("忽略了来自未知 Chat ID (%d) 的消息\n", incomingChatId)
+		return
+	}
+
+	if update.CallbackQuery != nil {
+		go handleCallbackQuery(update.CallbackQuery)
+	} else if update.Message != nil && update.Message.Text != "" {
+		go handleMessage(update.Message)
+	}
+}
+
+func handleMessage(msg *TgMessage) {
+	fmt.Printf("收到消息: %s 来自 Chat ID: %d\n", msg.Text, msg.Chat.Id)
+	chatIdStr := strconv.FormatInt(msg.Chat.Id, 10)
+
+	// Check for commands that might be part of a callback
+	command := msg.Text
+	if strings.HasPrefix(command, "/") {
+		parts := strings.Split(command, " ")
+		command = parts[0]
+	}
+
+	switch command {
+	case "/start", "/menu":
+		sendMainMenuKeyboard(chatIdStr)
+	case "/create":
+		sendTenantSelectionKeyboard(chatIdStr, "create_tenant", msg.MessageId)
+	case "/check_tenants":
+		go func() {
+			checkingMsg, err := sendMessage(chatIdStr, "", "正在检查所有租户凭证状态，请稍候...", nil)
+			if err != nil {
+				printlnErr("发送'检查租户'初始消息失败", err.Error())
+				return
+			}
+			app := &App{}
+			app.loadOracleSections(cfg)
+			resultText := app.checkAllTenantsActivity(true)
+			editMessage(checkingMsg.MessageId, chatIdStr, "所有租户凭证检查完成:", resultText, buildMainMenuKeyboard())
+		}()
+	case "/list_tasks":
+		sendTaskListKeyboard(chatIdStr, msg.MessageId)
+	case "/list_instances":
+		sendTenantSelectionKeyboard(chatIdStr, "list_instances_tenant", msg.MessageId)
+	default:
+		sendMessage(chatIdStr, "", "未知命令。使用 /menu 查看主菜单。", nil)
+	}
+}
+
+func handleCallbackQuery(cb *CallbackQuery) {
+	// Acknowledge the callback immediately to make the button responsive.
+	answerCallbackQuery(cb.Id)
+
+	chatIdStr := strconv.FormatInt(cb.Message.Chat.Id, 10)
+	parts := strings.Split(cb.Data, ":")
+	if len(parts) < 1 {
+		return
+	}
+	action := parts[0]
+
+	// Handle text commands sent via buttons
+	if strings.HasPrefix(action, "/") {
+		cb.Message.Text = action
+		handleMessage(cb.Message)
+		return
+	}
+
+	switch action {
+	case "main_menu":
+		editMessage(cb.Message.MessageId, chatIdStr, "主菜单", "", buildMainMenuKeyboard())
+	case "create_tenant":
+		tenantName := parts[1]
+		sendInstanceSelectionKeyboard(chatIdStr, tenantName, cb.Message.MessageId)
+	case "create_instance":
+		tenantName := parts[1]
+		instanceTemplate := parts[2]
+		go startCreationTask(chatIdStr, tenantName, instanceTemplate)
+		text := fmt.Sprintf("✅ 任务已创建!\n租户: %s\n模版: %s\n\n使用 /list_tasks 查看进度或停止任务。", tenantName, instanceTemplate)
+		editMessage(cb.Message.MessageId, chatIdStr, text, "", buildMainMenuKeyboard())
+	case "list_tasks":
+		sendTaskListKeyboard(chatIdStr, cb.Message.MessageId)
+	case "stop_task":
+		taskID := parts[1]
+		task, ok := taskManager.Get(taskID)
+		if ok {
+			task.cancelFunc()
+			task.UpdateStatus("正在停止...")
+		}
+		// Refresh the task list to show the updated status
+		sendTaskListKeyboard(chatIdStr, cb.Message.MessageId)
+	case "list_instances_tenant":
+		tenantName := parts[1]
+		go sendInstanceList(chatIdStr, tenantName, cb.Message.MessageId)
+	}
+}
+
+func sendMainMenuKeyboard(chatId string) {
+	text := "欢迎使用OCI助手机器人! 请选择一个操作:"
+	sendMessage(chatId, "", text, buildMainMenuKeyboard())
+}
+
+func buildMainMenuKeyboard() *InlineKeyboardMarkup {
+	return &InlineKeyboardMarkup{
+		InlineKeyboard: [][]InlineKeyboardButton{
+			{{Text: "⚙️ 创建实例", CallbackData: "/create"}},
+			{{Text: "📊 查看抢机任务", CallbackData: "/list_tasks"}},
+			{{Text: "🖥️ 查看实例列表", CallbackData: "/list_instances"}},
+			{{Text: "🔑 检查所有租户", CallbackData: "/check_tenants"}},
+		},
+	}
+}
+
+func sendTenantSelectionKeyboard(chatId, callbackPrefix string, messageId int) {
+	app := &App{}
+	app.loadOracleSections(cfg)
+	var buttons [][]InlineKeyboardButton
+	for _, section := range app.oracleSections {
+		row := []InlineKeyboardButton{
+			{Text: section.Name(), CallbackData: callbackPrefix + ":" + section.Name()},
+		}
+		buttons = append(buttons, row)
+	}
+	buttons = append(buttons, []InlineKeyboardButton{{Text: "« 返回主菜单", CallbackData: "main_menu"}})
+	keyboard := InlineKeyboardMarkup{InlineKeyboard: buttons}
+	editMessage(messageId, chatId, "请选择一个租户:", "", &keyboard)
+}
+
+func sendInstanceSelectionKeyboard(chatId, tenantName string, messageId int) {
+	app := &App{}
+	app.loadOracleSections(cfg)
+	var targetSection *ini.Section
+	for _, sec := range app.oracleSections {
+		if sec.Name() == tenantName {
+			targetSection = sec
+			break
+		}
+	}
+	if targetSection == nil {
+		editMessage(messageId, chatId, "错误: 未找到租户。", "", nil)
+		return
+	}
+	var instanceSections []*ini.Section
+	instanceSections = append(instanceSections, app.instanceBaseSection.ChildSections()...)
+	instanceSections = append(instanceSections, targetSection.ChildSections()...)
+	if len(instanceSections) == 0 {
+		editMessage(messageId, chatId, "此租户下未找到任何实例模版。", "", buildMainMenuKeyboard())
+		return
+	}
+	var buttons [][]InlineKeyboardButton
+	for _, sec := range instanceSections {
+		shape := sec.Key("shape").Value()
+		row := []InlineKeyboardButton{
+			{Text: fmt.Sprintf("%s (%s)", sec.Name(), shape), CallbackData: "create_instance:" + tenantName + ":" + sec.Name()},
+		}
+		buttons = append(buttons, row)
+	}
+	buttons = append(buttons, []InlineKeyboardButton{{Text: "« 返回主菜单", CallbackData: "main_menu"}})
+	keyboard := InlineKeyboardMarkup{InlineKeyboard: buttons}
+	editMessage(messageId, chatId, "请选择要创建的实例模版:", "", &keyboard)
+}
+
+func sendTaskListKeyboard(chatId string, messageId int) {
+	tasks := taskManager.List()
+	if len(tasks) == 0 {
+		editMessage(messageId, chatId, "当前没有正在运行的抢机任务。", "", buildMainMenuKeyboard())
+		return
+	}
+	var sb strings.Builder
+	sb.WriteString("当前抢机任务列表:\n\n")
+	var buttons [][]InlineKeyboardButton
+	for _, task := range tasks {
+		sb.WriteString(task.GetStatus() + "\n\n")
+		buttons = append(buttons, []InlineKeyboardButton{
+			{Text: "❌ 停止任务 " + task.ID[:8], CallbackData: "stop_task:" + task.ID},
+		})
+	}
+	buttons = append(buttons, []InlineKeyboardButton{{Text: "🔄 刷新", CallbackData: "list_tasks"}})
+	buttons = append(buttons, []InlineKeyboardButton{{Text: "« 返回主菜单", CallbackData: "main_menu"}})
+	keyboard := InlineKeyboardMarkup{InlineKeyboard: buttons}
+	editMessage(messageId, chatId, sb.String(), "", &keyboard)
+}
+
+func sendInstanceList(chatId, tenantName string, messageId int) {
+	editMessage(messageId, chatId, fmt.Sprintf("正在为租户 [%s] 获取实例列表...", tenantName), "", nil)
+	app := &App{}
+	app.loadOracleSections(cfg)
+	var targetSection *ini.Section
+	for _, sec := range app.oracleSections {
+		if sec.Name() == tenantName {
+			targetSection = sec
+			break
+		}
+	}
+	if targetSection == nil {
+		editMessage(messageId, chatId, "错误: 未找到租户。", "", buildMainMenuKeyboard())
+		return
+	}
+	if err := app.initializeClients(targetSection); err != nil {
+		editMessage(messageId, chatId, "错误: 初始化客户端失败: "+err.Error(), "", nil)
+		return
+	}
+	var allInstances []core.Instance
+	var instances []core.Instance
+	var nextPage *string
+	var err error
+	for {
+		instances, nextPage, err = ListInstances(ctx, app.clients.Compute, &app.oracleConfig.Tenancy, nextPage)
+		if err == nil {
+			allInstances = append(allInstances, instances...)
+		}
+		if nextPage == nil || len(instances) == 0 {
+			break
+		}
+	}
+
+	if err != nil {
+		editMessage(messageId, chatId, "错误: 获取实例列表失败: "+err.Error(), "", nil)
+		return
+	}
+	if len(allInstances) == 0 {
+		editMessage(messageId, chatId, fmt.Sprintf("租户 [%s] 下没有实例。", tenantName), "", buildMainMenuKeyboard())
+		return
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("租户 [%s] 的实例列表:\n", tenantName))
+	sb.WriteString("```\n")
+	for _, inst := range allInstances {
+		sb.WriteString(fmt.Sprintf("- %s (%s): %s\n", *inst.DisplayName, *inst.Shape, getInstanceState(inst.LifecycleState)))
+	}
+	sb.WriteString("```")
+	editMessage(messageId, chatId, sb.String(), "", buildMainMenuKeyboard())
+}
+
+func startCreationTask(chatId, tenantName, instanceTemplate string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	task := &CreationTask{
+		ID:               uuid.New().String(),
+		TenantName:       tenantName,
+		InstanceTemplate: instanceTemplate,
+		Status:           "初始化中",
+		StartTime:        time.Now(),
+		cancelFunc:       cancel,
+	}
+	taskManager.Add(task)
+	defer taskManager.Remove(task.ID)
+
+	app := &App{}
+	app.loadOracleSections(cfg)
+	var targetSection *ini.Section
+	for _, sec := range app.oracleSections {
+		if sec.Name() == tenantName {
+			targetSection = sec
+			break
+		}
+	}
+	if targetSection == nil {
+		task.UpdateStatus("失败: 未找到租户")
+		return
+	}
+	if err := app.initializeClients(targetSection); err != nil {
+		task.UpdateStatus("失败: 初始化客户端失败")
+		return
+	}
+	var instanceSections []*ini.Section
+	instanceSections = append(instanceSections, app.instanceBaseSection.ChildSections()...)
+	instanceSections = append(instanceSections, targetSection.ChildSections()...)
+	var targetInstanceSection *ini.Section
+	for _, sec := range instanceSections {
+		if sec.Name() == instanceTemplate {
+			targetInstanceSection = sec
+			break
+		}
+	}
+	if targetInstanceSection == nil {
+		task.UpdateStatus("失败: 未找到实例模版")
+		return
+	}
+	instance := Instance{}
+	if err := targetInstanceSection.MapTo(&instance); err != nil {
+		task.UpdateStatus("失败: 解析实例模版失败")
+		return
+	}
+
+	appConfig.chat_id = chatId
+	appConfig.each = true
+	task.TotalCount = instance.Sum
+	task.UpdateStatus("运行中")
+	app.LaunchInstances(ctx, task, app.availabilityDomains, instance)
+
+	finalStatus := task.Status
+	if finalStatus == "运行中" {
+		finalStatus = "完成"
+	}
+	task.UpdateStatus(finalStatus)
+	sendMessage(chatId, "", "任务 "+task.ID[:8]+" 已结束，状态: "+finalStatus, nil)
+}
+
+func answerCallbackQuery(callbackQueryId string) {
+	client := getTgClient()
+	apiURL := "https://api.telegram.org/bot" + appConfig.token + "/answerCallbackQuery"
+	_, err := client.PostForm(apiURL, url.Values{"callback_query_id": {callbackQueryId}})
+	if err != nil {
+		printlnErr("回答Callback Query失败", err.Error())
+	}
+}
+
+func (app *App) LaunchInstances(ctx context.Context, task *CreationTask, ads []identity.AvailabilityDomain, instance Instance) {
+	var adCount int32 = int32(len(ads))
+	adName := common.String(instance.AvailabilityDomain)
+	each := instance.Each
+	sum := instance.Sum
+	if sum == 0 {
+		sum = 1 // Default to creating 1 instance if sum is not set
+	}
+	task.TotalCount = sum
+
+	var usableAds = make([]identity.AvailabilityDomain, 0)
+	var AD_NOT_FIXED bool = false
+	var EACH_AD = false
+	if adName == nil || *adName == "" {
+		AD_NOT_FIXED = true
+		if each > 0 {
+			EACH_AD = true
+			sum = each * adCount
+			task.TotalCount = sum
+		} else {
+			EACH_AD = false
+			usableAds = ads
+		}
+	}
+	name := instance.InstanceDisplayName
+	if name == "" {
+		name = time.Now().Format("instance-20060102-1504")
+	}
+	displayName := common.String(name)
+	if sum > 1 {
+		displayName = common.String(name + "-1")
+	}
+	request := core.LaunchInstanceRequest{}
+	request.CompartmentId = common.String(app.oracleConfig.Tenancy)
+	request.DisplayName = displayName
+	image, err := GetImage(context.Background(), app.clients.Compute, &app.oracleConfig.Tenancy, instance.OperatingSystem, instance.OperatingSystemVersion, instance.Shape)
+	if err != nil {
+		printlnErr("获取系统镜像失败", err.Error())
+		task.UpdateStatus("失败: " + err.Error())
+		return
+	}
+	var shape core.Shape
+	if strings.Contains(strings.ToLower(instance.Shape), "flex") && instance.Ocpus > 0 && instance.MemoryInGBs > 0 {
+		shape.Shape = &instance.Shape
+		shape.Ocpus = &instance.Ocpus
+		shape.MemoryInGBs = &instance.MemoryInGBs
+	} else {
+		shape, err = getShape(app.clients.Compute, image.Id, instance.Shape, &app.oracleConfig.Tenancy)
+		if err != nil {
+			printlnErr("获取Shape信息失败", err.Error())
+			task.UpdateStatus("失败: " + err.Error())
+			return
+		}
+	}
+	request.Shape = shape.Shape
+	if strings.Contains(strings.ToLower(*shape.Shape), "flex") {
+		request.ShapeConfig = &core.LaunchInstanceShapeConfigDetails{
+			Ocpus:       shape.Ocpus,
+			MemoryInGBs: shape.MemoryInGBs,
+		}
+		if instance.Burstable == "1/8" {
+			request.ShapeConfig.BaselineOcpuUtilization = core.LaunchInstanceShapeConfigDetailsBaselineOcpuUtilization8
+		} else if instance.Burstable == "1/2" {
+			request.ShapeConfig.BaselineOcpuUtilization = core.LaunchInstanceShapeConfigDetailsBaselineOcpuUtilization2
+		}
+	}
+	subnet, err := CreateOrGetNetworkInfrastructure(context.Background(), app.clients.Network, &app.oracleConfig.Tenancy, instance)
+	if err != nil {
+		printlnErr("获取子网失败", err.Error())
+		task.UpdateStatus("失败: " + err.Error())
+		return
+	}
+	request.CreateVnicDetails = &core.CreateVnicDetails{SubnetId: subnet.Id}
+	sd := core.InstanceSourceViaImageDetails{}
+	sd.ImageId = image.Id
+	if instance.BootVolumeSizeInGBs > 0 {
+		sd.BootVolumeSizeInGBs = common.Int64(instance.BootVolumeSizeInGBs)
+	}
+	request.SourceDetails = sd
+	request.IsPvEncryptionInTransitEnabled = common.Bool(true)
+	metaData := map[string]string{}
+	metaData["ssh_authorized_keys"] = instance.SSH_Public_Key
+	if instance.CloudInit != "" {
+		encodedString := base64.StdEncoding.EncodeToString([]byte(instance.CloudInit))
+		metaData["user_data"] = encodedString
+	}
+	request.Metadata = metaData
+	minTime := instance.MinTime
+	maxTime := instance.MaxTime
+	SKIP_RETRY_MAP := make(map[int32]bool)
+	var failTimes int32 = 0
+	var adIndex int32 = 0
+	var pos int32 = 0
+	var SUCCESS = false
+
+	for pos < sum {
+		select {
+		case <-ctx.Done():
+			task.UpdateStatus("用户已手动停止")
+			return
+		default:
+		}
+		task.mu.Lock()
+		task.Attempts++
+		task.mu.Unlock()
+
+		if AD_NOT_FIXED {
+			if EACH_AD {
+				if pos%each == 0 && failTimes == 0 {
+					adName = ads[adIndex].Name
+					adIndex++
+				}
+			} else {
+				if SUCCESS {
+					adIndex = 0
+				}
+				if adIndex >= adCount {
+					adIndex = 0
+				}
+				adName = usableAds[adIndex].Name
+				adIndex++
+			}
+		}
+		request.AvailabilityDomain = adName
+		createResp, err := app.clients.Compute.LaunchInstance(context.Background(), request)
+		if err == nil {
+			SUCCESS = true
+			task.mu.Lock()
+			task.SuccessCount++
+			task.mu.Unlock()
+
+			ips, errIp := getInstancePublicIps(app.clients, createResp.Instance.Id)
+			var text string
+			if errIp != nil {
+				text = fmt.Sprintf("✅ 第 %d/%d 个实例抢到了，但启动失败: %s", task.SuccessCount, task.TotalCount, errIp.Error())
+			} else {
+				text = fmt.Sprintf("✅ 第 %d/%d 个实例抢到了! IP: %s", task.SuccessCount, task.TotalCount, strings.Join(ips, ","))
+			}
+			sendMessage(appConfig.chat_id, fmt.Sprintf("[%s]", app.oracleSectionName), text, nil)
+			pos++
+			displayName = common.String(fmt.Sprintf("%s-%d", name, pos+1))
+			request.DisplayName = displayName
+		} else {
+			SUCCESS = false
+			errInfo := err.Error()
+			servErr, isServErr := common.IsServiceError(err)
+			if isServErr {
+				errInfo = servErr.GetMessage()
+				task.mu.Lock()
+				if time.Since(task.LastMessageTimestamp) > 30*time.Second && task.LastMessage != errInfo {
+					task.LastMessage = errInfo
+					task.LastMessageTimestamp = time.Now()
+					sendMessage(appConfig.chat_id, fmt.Sprintf("[%s]", app.oracleSectionName), "❌ 抢机失败: "+errInfo, nil)
+				}
+				task.mu.Unlock()
+			}
+			if isServErr && (400 <= servErr.GetHTTPStatusCode() && servErr.GetHTTPStatusCode() <= 405) ||
+				(servErr.GetHTTPStatusCode() == 409 && !strings.EqualFold(servErr.GetCode(), "IncorrectState")) ||
+				servErr.GetHTTPStatusCode() == 412 || servErr.GetHTTPStatusCode() == 413 || servErr.GetHTTPStatusCode() == 422 ||
+				servErr.GetHTTPStatusCode() == 431 || servErr.GetHTTPStatusCode() == 501 {
+				if AD_NOT_FIXED && !EACH_AD {
+					SKIP_RETRY_MAP[adIndex-1] = true
+				}
+			}
+		}
+		sleepRandomSecond(minTime, maxTime)
+	}
+}
+
 func (app *App) selectOracleAccount() (*ini.Section, bool) {
 	if len(app.oracleSections) == 1 {
 		return app.oracleSections[0], false
@@ -255,8 +933,6 @@ func (app *App) selectOracleAccount() (*ini.Section, bool) {
 		fmt.Printf("\033[1;31m错误! 请输入正确的序号\033[0m\n")
 	}
 }
-
-// initializeClients sets up all necessary OCI clients for the selected account.
 func (app *App) initializeClients(oracleSec *ini.Section) error {
 	app.oracleSection = oracleSec
 	app.oracleSectionName = oracleSec.Name()
@@ -312,8 +988,6 @@ func (app *App) initializeClients(oracleSec *ini.Section) error {
 
 	return nil
 }
-
-// showMainMenu displays the main menu and handles user actions.
 func (app *App) showMainMenu() {
 	for {
 		fmt.Printf("\n\033[1;32m欢迎使用甲骨文实例管理工具\033[0m \n(当前账号: %s)\n\n", app.oracleSectionName)
@@ -364,7 +1038,6 @@ func (app *App) showMainMenu() {
 		}
 	}
 }
-
 func (app *App) listInstances() {
 	fmt.Println("正在获取实例数据...")
 	var instances []core.Instance
@@ -498,7 +1171,6 @@ func (app *App) listInstances() {
 	}
 	app.instanceDetails(instances[index-1].Id)
 }
-
 func (app *App) instanceDetails(instanceId *string) {
 	for {
 		fmt.Println("正在获取实例详细信息...")
@@ -718,7 +1390,6 @@ func (app *App) instanceDetails(instanceId *string) {
 		}
 	}
 }
-
 func (app *App) listBootVolumes() {
 	var bootVolumes []core.BootVolume
 	var wg sync.WaitGroup
@@ -764,7 +1435,6 @@ func (app *App) listBootVolumes() {
 	}
 	app.bootvolumeDetails(bootVolumes[index-1].Id)
 }
-
 func (app *App) bootvolumeDetails(bootVolumeId *string) {
 	for {
 		fmt.Println("正在获取引导卷详细信息...")
@@ -905,7 +1575,6 @@ func (app *App) bootvolumeDetails(bootVolumeId *string) {
 		}
 	}
 }
-
 func (app *App) listLaunchInstanceTemplates() {
 	var instanceSections []*ini.Section
 	instanceSections = append(instanceSections, app.instanceBaseSection.ChildSections()...)
@@ -960,11 +1629,15 @@ func (app *App) listLaunchInstanceTemplates() {
 			continue
 		}
 
-		app.LaunchInstances(app.availabilityDomains, instance)
+		// This call needs to be adapted for CLI mode if tasks are used
+		// For now, it will not have cancellation in CLI mode.
+		taskCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		task := &CreationTask{ID: "cli_task"} // Dummy task for CLI
+		app.LaunchInstances(taskCtx, task, app.availabilityDomains, instance)
 	}
 
 }
-
 func (app *App) multiBatchLaunchInstances() {
 	IPsFilePath := IPsFilePrefix + "-" + time.Now().Format("2006-01-02-150405.txt")
 	for _, sec := range app.oracleSections {
@@ -980,7 +1653,6 @@ func (app *App) multiBatchLaunchInstances() {
 		sleepRandomSecond(5, 5)
 	}
 }
-
 func (app *App) batchLaunchInstances(oracleSec *ini.Section) {
 	var instanceSections []*ini.Section
 	instanceSections = append(instanceSections, app.instanceBaseSection.ChildSections()...)
@@ -990,9 +1662,9 @@ func (app *App) batchLaunchInstances(oracleSec *ini.Section) {
 	}
 
 	printf("\033[1;36m[%s] 开始创建\033[0m\n", app.oracleSectionName)
-	var SUM, NUM int32 = 0, 0
-	sendMessage(fmt.Sprintf("[%s]", app.oracleSectionName), "开始创建")
+	sendMessage(appConfig.chat_id, fmt.Sprintf("[%s]", app.oracleSectionName), "开始创建", nil)
 
+	var SUM, NUM int32 = 0, 0
 	for _, instanceSec := range instanceSections {
 		instance := Instance{}
 		err := instanceSec.MapTo(&instance)
@@ -1000,18 +1672,17 @@ func (app *App) batchLaunchInstances(oracleSec *ini.Section) {
 			printlnErr("解析实例模版参数失败", err.Error())
 			continue
 		}
-
-		sum, num := app.LaunchInstances(app.availabilityDomains, instance)
-
-		SUM += sum
-		NUM += num
-
+		taskCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		task := &CreationTask{ID: "cli_batch_task"} // Dummy task
+		app.LaunchInstances(taskCtx, task, app.availabilityDomains, instance)
+		SUM += task.TotalCount
+		NUM += task.SuccessCount
 	}
 	printf("\033[1;36m[%s] 结束创建。创建实例总数: %d, 成功 %d , 失败 %d\033[0m\n", app.oracleSectionName, SUM, NUM, SUM-NUM)
 	text := fmt.Sprintf("结束创建。创建实例总数: %d, 成功 %d , 失败 %d", SUM, NUM, SUM-NUM)
-	sendMessage(fmt.Sprintf("[%s]", app.oracleSectionName), text)
+	sendMessage(appConfig.chat_id, fmt.Sprintf("[%s]", app.oracleSectionName), text, nil)
 }
-
 func (app *App) multiBatchListInstancesIp() {
 	IPsFilePath := IPsFilePrefix + "-" + time.Now().Format("2006-01-02-150405.txt")
 	_, err := os.Stat(IPsFilePath)
@@ -1029,7 +1700,6 @@ func (app *App) multiBatchListInstancesIp() {
 	}
 	fmt.Printf("导出实例公共IP地址完成，请查看文件 %s\n", IPsFilePath)
 }
-
 func (app *App) batchListInstancesIp(filePath string, sec *ini.Section) {
 	_, err := os.Stat(filePath)
 	if err != nil && os.IsNotExist(err) {
@@ -1039,7 +1709,6 @@ func (app *App) batchListInstancesIp(filePath string, sec *ini.Section) {
 	app.ListInstancesIPs(filePath, sec.Name())
 	fmt.Printf("导出实例IP地址完成，请查看文件 %s\n", filePath)
 }
-
 func (app *App) ListInstancesIPs(filePath string, sectionName string) {
 	var vnicAttachments []core.VnicAttachment
 	var vas []core.VnicAttachment
@@ -1087,341 +1756,6 @@ func (app *App) ListInstancesIPs(filePath string, sectionName string) {
 		fmt.Printf("%s\n", err.Error())
 	}
 }
-
-// 返回值 sum: 创建实例总数; num: 创建成功的个数
-func (app *App) LaunchInstances(ads []identity.AvailabilityDomain, instance Instance) (sum, num int32) {
-	/* 创建实例的几种情况
-	 * 1. 设置了 availabilityDomain 参数，即在设置的可用性域中创建 sum 个实例。
-	 * 2. 没有设置 availabilityDomain 但是设置了 each 参数。即在获取的每个可用性域中创建 each 个实例，创建的实例总数 sum =  each * adCount。
-	 * 3. 没有设置 availabilityDomain 且没有设置 each 参数，即在获取到的可用性域中创建的实例总数为 sum。
-	 */
-
-	//可用性域数量
-	var adCount int32 = int32(len(ads))
-	adName := common.String(instance.AvailabilityDomain)
-	each := instance.Each
-	sum = instance.Sum
-
-	// 没有设置可用性域并且没有设置each时，才有用。
-	var usableAds = make([]identity.AvailabilityDomain, 0)
-
-	//可用性域不固定，即没有提供 availabilityDomain 参数
-	var AD_NOT_FIXED bool = false
-	var EACH_AD = false
-	if adName == nil || *adName == "" {
-		AD_NOT_FIXED = true
-		if each > 0 {
-			EACH_AD = true
-			sum = each * adCount
-		} else {
-			EACH_AD = false
-			usableAds = ads
-		}
-	}
-
-	name := instance.InstanceDisplayName
-	if name == "" {
-		name = time.Now().Format("instance-20060102-1504")
-	}
-	displayName := common.String(name)
-	if sum > 1 {
-		displayName = common.String(name + "-1")
-	}
-	// create the launch instance request
-	request := core.LaunchInstanceRequest{}
-	request.CompartmentId = common.String(app.oracleConfig.Tenancy)
-	request.DisplayName = displayName
-
-	// Get a image.
-	fmt.Println("正在获取系统镜像...")
-	image, err := GetImage(ctx, app.clients.Compute, &app.oracleConfig.Tenancy, instance.OperatingSystem, instance.OperatingSystemVersion, instance.Shape)
-	if err != nil {
-		printlnErr("获取系统镜像失败", err.Error())
-		return
-	}
-	fmt.Println("系统镜像:", *image.DisplayName)
-
-	var shape core.Shape
-	if strings.Contains(strings.ToLower(instance.Shape), "flex") && instance.Ocpus > 0 && instance.MemoryInGBs > 0 {
-		shape.Shape = &instance.Shape
-		shape.Ocpus = &instance.Ocpus
-		shape.MemoryInGBs = &instance.MemoryInGBs
-	} else {
-		fmt.Println("正在获取Shape信息...")
-		shape, err = getShape(app.clients.Compute, image.Id, instance.Shape, &app.oracleConfig.Tenancy)
-		if err != nil {
-			printlnErr("获取Shape信息失败", err.Error())
-			return
-		}
-	}
-
-	request.Shape = shape.Shape
-	if strings.Contains(strings.ToLower(*shape.Shape), "flex") {
-		request.ShapeConfig = &core.LaunchInstanceShapeConfigDetails{
-			Ocpus:       shape.Ocpus,
-			MemoryInGBs: shape.MemoryInGBs,
-		}
-		if instance.Burstable == "1/8" {
-			request.ShapeConfig.BaselineOcpuUtilization = core.LaunchInstanceShapeConfigDetailsBaselineOcpuUtilization8
-		} else if instance.Burstable == "1/2" {
-			request.ShapeConfig.BaselineOcpuUtilization = core.LaunchInstanceShapeConfigDetailsBaselineOcpuUtilization2
-		}
-	}
-
-	// create a subnet or get the one already created
-	fmt.Println("正在获取子网...")
-	subnet, err := CreateOrGetNetworkInfrastructure(ctx, app.clients.Network, &app.oracleConfig.Tenancy, instance)
-	if err != nil {
-		printlnErr("获取子网失败", err.Error())
-		return
-	}
-	fmt.Println("子网:", *subnet.DisplayName)
-	request.CreateVnicDetails = &core.CreateVnicDetails{SubnetId: subnet.Id}
-
-	sd := core.InstanceSourceViaImageDetails{}
-	sd.ImageId = image.Id
-	if instance.BootVolumeSizeInGBs > 0 {
-		sd.BootVolumeSizeInGBs = common.Int64(instance.BootVolumeSizeInGBs)
-	}
-	request.SourceDetails = sd
-	request.IsPvEncryptionInTransitEnabled = common.Bool(true)
-
-	metaData := map[string]string{}
-	metaData["ssh_authorized_keys"] = instance.SSH_Public_Key
-	if instance.CloudInit != "" {
-		// Base64 a string
-		encodedString := base64.StdEncoding.EncodeToString([]byte(instance.CloudInit))
-		metaData["user_data"] = encodedString
-	}
-	request.Metadata = metaData
-
-	minTime := instance.MinTime
-	maxTime := instance.MaxTime
-
-	SKIP_RETRY_MAP := make(map[int32]bool)
-	var usableAdsTemp = make([]identity.AvailabilityDomain, 0)
-
-	retry := instance.Retry // 重试次数
-	var failTimes int32 = 0 // 失败次数
-
-	// 记录尝试创建实例的次数
-	var runTimes int32 = 0
-
-	var adIndex int32 = 0 // 当前可用性域下标
-	var pos int32 = 0     // for 循环次数
-	var SUCCESS = false   // 创建是否成功
-
-	var startTime = time.Now()
-
-	var bootVolumeSize float64
-	if instance.BootVolumeSizeInGBs > 0 {
-		bootVolumeSize = float64(instance.BootVolumeSizeInGBs)
-	} else if image.SizeInMBs != nil {
-		bootVolumeSize = math.Round(float64(*image.SizeInMBs) / float64(1024))
-	} else {
-		bootVolumeSize = 50 // Default
-	}
-	printf("\033[1;36m[%s] 开始创建 %s 实例, OCPU: %g 内存: %g 引导卷: %g \033[0m\n", app.oracleSectionName, *shape.Shape, *shape.Ocpus, *shape.MemoryInGBs, bootVolumeSize)
-	if appConfig.each {
-		text := fmt.Sprintf("正在尝试创建第 %d 个实例...⏳\n区域: %s\n实例配置: %s\nOCPU计数: %g\n内存(GB): %g\n引导卷(GB): %g\n创建个数: %d", pos+1, app.oracleConfig.Region, *shape.Shape, *shape.Ocpus, *shape.MemoryInGBs, bootVolumeSize, sum)
-		_, err := sendMessage("", text)
-		if err != nil {
-			printlnErr("Telegram 消息提醒发送失败", err.Error())
-		}
-	}
-
-	for pos < sum {
-
-		if AD_NOT_FIXED {
-			if EACH_AD {
-				if pos%each == 0 && failTimes == 0 {
-					adName = ads[adIndex].Name
-					adIndex++
-				}
-			} else {
-				if SUCCESS {
-					adIndex = 0
-				}
-				if adIndex >= adCount {
-					adIndex = 0
-				}
-				//adName = ads[adIndex].Name
-				adName = usableAds[adIndex].Name
-				adIndex++
-			}
-		}
-
-		runTimes++
-		printf("\033[1;36m[%s] 正在尝试创建第 %d 个实例, AD: %s\033[0m\n", app.oracleSectionName, pos+1, *adName)
-		printf("\033[1;36m[%s] 当前尝试次数: %d \033[0m\n", app.oracleSectionName, runTimes)
-		request.AvailabilityDomain = adName
-		createResp, err := app.clients.Compute.LaunchInstance(ctx, request)
-
-		if err == nil {
-			// 创建实例成功
-			SUCCESS = true
-			num++ //成功个数+1
-
-			duration := fmtDuration(time.Since(startTime))
-
-			printf("\033[1;32m[%s] 第 %d 个实例抢到了🎉, 正在启动中请稍等...⌛️ \033[0m\n", app.oracleSectionName, pos+1)
-			var msg Message
-			var msgErr error
-			var text string
-			if appConfig.each {
-				text = fmt.Sprintf("第 %d 个实例抢到了🎉, 正在启动中请稍等...⌛️\n区域: %s\n实例名称: %s\n公共IP: 获取中...⏳\n可用性域:%s\n实例配置: %s\nOCPU计数: %g\n内存(GB): %g\n引导卷(GB): %g\n创建个数: %d\n尝试次数: %d\n耗时: %s", pos+1, app.oracleConfig.Region, *createResp.Instance.DisplayName, *createResp.Instance.AvailabilityDomain, *shape.Shape, *shape.Ocpus, *shape.MemoryInGBs, bootVolumeSize, sum, runTimes, duration)
-				msg, msgErr = sendMessage("", text)
-			}
-			// 获取实例公共IP
-			var strIps string
-			ips, err := getInstancePublicIps(app.clients, createResp.Instance.Id)
-			if err != nil {
-				printf("\033[1;32m[%s] 第 %d 个实例抢到了🎉, 但是启动失败❌ 错误信息: \033[0m%s\n", app.oracleSectionName, pos+1, err.Error())
-				text = fmt.Sprintf("第 %d 个实例抢到了🎉, 但是启动失败❌实例已被终止😔\n区域: %s\n实例名称: %s\n可用性域:%s\n实例配置: %s\nOCPU计数: %g\n内存(GB): %g\n引导卷(GB): %g\n创建个数: %d\n尝试次数: %d\n耗时: %s", pos+1, app.oracleConfig.Region, *createResp.Instance.DisplayName, *createResp.Instance.AvailabilityDomain, *shape.Shape, *shape.Ocpus, *shape.MemoryInGBs, bootVolumeSize, sum, runTimes, duration)
-			} else {
-				strIps = strings.Join(ips, ",")
-				printf("\033[1;32m[%s] 第 %d 个实例抢到了🎉, 启动成功✅. 实例名称: %s, 公共IP: %s\033[0m\n", app.oracleSectionName, pos+1, *createResp.Instance.DisplayName, strIps)
-				text = fmt.Sprintf("第 %d 个实例抢到了🎉, 启动成功✅\n区域: %s\n实例名称: %s\n公共IP: %s\n可用性域:%s\n实例配置: %s\nOCPU计数: %g\n内存(GB): %g\n引导卷(GB): %g\n创建个数: %d\n尝试次数: %d\n耗时: %s", pos+1, app.oracleConfig.Region, *createResp.Instance.DisplayName, strIps, *createResp.Instance.AvailabilityDomain, *shape.Shape, *shape.Ocpus, *shape.MemoryInGBs, bootVolumeSize, sum, runTimes, duration)
-			}
-			if appConfig.each {
-				if msgErr != nil {
-					sendMessage("", text)
-				} else {
-					editMessage(msg.MessageId, "", text)
-				}
-			}
-
-			sleepRandomSecond(minTime, maxTime)
-
-			displayName = common.String(fmt.Sprintf("%s-%d", name, pos+2)) // pos starts from 0, so next is pos+2
-			request.DisplayName = displayName
-
-		} else {
-			// 创建实例失败
-			SUCCESS = false
-			// 错误信息
-			errInfo := err.Error()
-			// 是否跳过重试
-			SKIP_RETRY := false
-
-			//isRetryable := common.IsErrorRetryableByDefault(err)
-			//isNetErr := common.IsNetworkError(err)
-			servErr, isServErr := common.IsServiceError(err)
-
-			// API Errors: https://docs.cloud.oracle.com/Content/API/References/apierrors.htm
-
-			if isServErr && (400 <= servErr.GetHTTPStatusCode() && servErr.GetHTTPStatusCode() <= 405) ||
-				(servErr.GetHTTPStatusCode() == 409 && !strings.EqualFold(servErr.GetCode(), "IncorrectState")) ||
-				servErr.GetHTTPStatusCode() == 412 || servErr.GetHTTPStatusCode() == 413 || servErr.GetHTTPStatusCode() == 422 ||
-				servErr.GetHTTPStatusCode() == 431 || servErr.GetHTTPStatusCode() == 501 {
-				// 不可重试
-				if isServErr {
-					errInfo = servErr.GetMessage()
-				}
-				duration := fmtDuration(time.Since(startTime))
-				printf("\033[1;31m[%s] 第 %d 个实例创建失败了❌, 错误信息: \033[0m%s\n", app.oracleSectionName, pos+1, errInfo)
-				if appConfig.each {
-					text := fmt.Sprintf("第 %d 个实例创建失败了❌\n错误信息: %s\n区域: %s\n可用性域: %s\n实例配置: %s\nOCPU计数: %g\n内存(GB): %g\n引导卷(GB): %g\n创建个数: %d\n尝试次数: %d\n耗时:%s", pos+1, errInfo, app.oracleConfig.Region, *adName, *shape.Shape, *shape.Ocpus, *shape.MemoryInGBs, bootVolumeSize, sum, runTimes, duration)
-					sendMessage("", text)
-				}
-
-				SKIP_RETRY = true
-				if AD_NOT_FIXED && !EACH_AD {
-					SKIP_RETRY_MAP[adIndex-1] = true
-				}
-
-			} else {
-				// 可重试
-				if isServErr {
-					errInfo = servErr.GetMessage()
-				}
-				printf("\033[1;31m[%s] 创建失败, Error: \033[0m%s\n", app.oracleSectionName, errInfo)
-
-				SKIP_RETRY = false
-				if AD_NOT_FIXED && !EACH_AD {
-					SKIP_RETRY_MAP[adIndex-1] = false
-				}
-			}
-
-			sleepRandomSecond(minTime, maxTime)
-
-			if AD_NOT_FIXED {
-				if !EACH_AD {
-					if adIndex < adCount {
-						// 没有设置可用性域，且没有设置each。即在获取到的每个可用性域里尝试创建。当前使用的可用性域不是最后一个，继续尝试。
-						continue
-					} else {
-						// 当前使用的可用性域是最后一个，判断失败次数是否达到重试次数，未达到重试次数继续尝试。
-						failTimes++
-
-						for index, skip := range SKIP_RETRY_MAP {
-							if !skip {
-								usableAdsTemp = append(usableAdsTemp, usableAds[index])
-							}
-						}
-
-						// 重新设置 usableAds
-						usableAds = usableAdsTemp
-						adCount = int32(len(usableAds))
-
-						// 重置变量
-						usableAdsTemp = nil
-						for k := range SKIP_RETRY_MAP {
-							delete(SKIP_RETRY_MAP, k)
-						}
-
-						// 判断是否需要重试
-						if (retry < 0 || failTimes <= retry) && adCount > 0 {
-							continue
-						}
-					}
-
-					adIndex = 0
-
-				} else {
-					// 没有设置可用性域，且设置了each，即在每个域创建each个实例。判断失败次数继续尝试。
-					failTimes++
-					if (retry < 0 || failTimes <= retry) && !SKIP_RETRY {
-						continue
-					}
-				}
-
-			} else {
-				//设置了可用性域，判断是否需要重试
-				failTimes++
-				if (retry < 0 || failTimes <= retry) && !SKIP_RETRY {
-					continue
-				}
-			}
-
-		}
-
-		// 重置变量
-		usableAds = ads
-		adCount = int32(len(usableAds))
-		usableAdsTemp = nil
-		for k := range SKIP_RETRY_MAP {
-			delete(SKIP_RETRY_MAP, k)
-		}
-
-		// 成功或者失败次数达到重试次数，重置失败次数为0
-		failTimes = 0
-
-		// 重置尝试创建实例次数
-		runTimes = 0
-		startTime = time.Now()
-
-		// for 循环次数+1
-		pos++
-
-		if pos < sum && appConfig.each {
-			text := fmt.Sprintf("正在尝试创建第 %d 个实例...⏳\n区域: %s\n实例配置: %s\nOCPU计数: %g\n内存(GB): %g\n引导卷(GB): %g\n创建个数: %d", pos+1, app.oracleConfig.Region, *shape.Shape, *shape.Ocpus, *shape.MemoryInGBs, bootVolumeSize, sum)
-			sendMessage("", text)
-		}
-	}
-	return
-}
-
 func sleepRandomSecond(min, max int32) {
 	var second int32
 	if min <= 0 || max <= 0 {
@@ -1434,7 +1768,6 @@ func sleepRandomSecond(min, max int32) {
 	printf("Sleep %d Second...\n", second)
 	time.Sleep(time.Duration(second) * time.Second)
 }
-
 func getProvider(oracle Oracle) (common.ConfigurationProvider, error) {
 	content, err := ioutil.ReadFile(oracle.Key_file)
 	if err != nil {
@@ -1444,8 +1777,6 @@ func getProvider(oracle Oracle) (common.ConfigurationProvider, error) {
 	privateKeyPassphrase := common.String(oracle.Key_password)
 	return common.NewRawConfigurationProvider(oracle.Tenancy, oracle.User, oracle.Region, oracle.Fingerprint, privateKey, privateKeyPassphrase), nil
 }
-
-// 创建或获取基础网络设施
 func CreateOrGetNetworkInfrastructure(ctx context.Context, c core.VirtualNetworkClient, tenancyId *string, instance Instance) (subnet core.Subnet, err error) {
 	var vcn core.Vcn
 	vcn, err = createOrGetVcn(ctx, c, tenancyId, instance)
@@ -1470,9 +1801,6 @@ func CreateOrGetNetworkInfrastructure(ctx context.Context, c core.VirtualNetwork
 		tenancyId)
 	return
 }
-
-// CreateOrGetSubnetWithDetails either creates a new subnet or gets an existing one.
-// It prioritizes reusing existing subnets. If creation is necessary, it handles CIDR conflicts.
 func createOrGetSubnetWithDetails(ctx context.Context, c core.VirtualNetworkClient, vcnID *string,
 	displayName *string, cidrBlock *string, dnsLabel *string, availableDomain *string, tenancyId *string) (subnet core.Subnet, err error) {
 
@@ -1624,8 +1952,6 @@ func createOrGetSubnetWithDetails(ctx context.Context, c core.VirtualNetworkClie
 	// If the loop finishes without successfully creating a subnet
 	return subnet, fmt.Errorf("failed to create a subnet after multiple attempts: %w", err)
 }
-
-// 列出指定虚拟云网络 (VCN) 中的所有子网
 func listSubnets(ctx context.Context, c core.VirtualNetworkClient, vcnID, tenancyId *string) (subnets []core.Subnet, err error) {
 	request := core.ListSubnetsRequest{
 		CompartmentId:   tenancyId,
@@ -1640,8 +1966,6 @@ func listSubnets(ctx context.Context, c core.VirtualNetworkClient, vcnID, tenanc
 	subnets = r.Items
 	return
 }
-
-// 创建一个新的虚拟云网络 (VCN) 或获取已经存在的虚拟云网络
 func createOrGetVcn(ctx context.Context, c core.VirtualNetworkClient, tenancyId *string, instance Instance) (core.Vcn, error) {
 	var vcn core.Vcn
 	vcnItems, err := listVcns(ctx, c, tenancyId)
@@ -1679,8 +2003,6 @@ func createOrGetVcn(ctx context.Context, c core.VirtualNetworkClient, tenancyId 
 	vcn = r.Vcn
 	return vcn, err
 }
-
-// 列出所有虚拟云网络 (VCN)
 func listVcns(ctx context.Context, c core.VirtualNetworkClient, tenancyId *string) ([]core.Vcn, error) {
 	request := core.ListVcnsRequest{
 		CompartmentId:   tenancyId,
@@ -1692,8 +2014,6 @@ func listVcns(ctx context.Context, c core.VirtualNetworkClient, tenancyId *strin
 	}
 	return r.Items, err
 }
-
-// 创建或者获取 Internet 网关
 func createOrGetInternetGateway(c core.VirtualNetworkClient, vcnID, tenancyId *string) (core.InternetGateway, error) {
 	//List Gateways
 	var gateway core.InternetGateway
@@ -1737,8 +2057,6 @@ func createOrGetInternetGateway(c core.VirtualNetworkClient, vcnID, tenancyId *s
 	}
 	return gateway, err
 }
-
-// 创建或者获取路由表
 func createOrGetRouteTable(c core.VirtualNetworkClient, gatewayID, VcnID, tenancyId *string) (routeTable core.RouteTable, err error) {
 	//List Route Table
 	listRTRequest := core.ListRouteTablesRequest{
@@ -1792,8 +2110,6 @@ func createOrGetRouteTable(c core.VirtualNetworkClient, gatewayID, VcnID, tenanc
 	}
 	return
 }
-
-// 获取符合条件系统镜像中的第一个
 func GetImage(ctx context.Context, c core.ComputeClient, tenancyId *string, os, osVersion, shape string) (image core.Image, err error) {
 	var images []core.Image
 	images, err = listImages(ctx, c, tenancyId, os, osVersion, shape)
@@ -1807,8 +2123,6 @@ func GetImage(ctx context.Context, c core.ComputeClient, tenancyId *string, os, 
 	}
 	return
 }
-
-// 列出所有符合条件的系统镜像
 func listImages(ctx context.Context, c core.ComputeClient, tenancyId *string, os, osVersion, shape string) ([]core.Image, error) {
 	if os == "" || osVersion == "" {
 		return nil, errors.New("操作系统类型和版本不能为空, 请检查配置文件")
@@ -1823,7 +2137,6 @@ func listImages(ctx context.Context, c core.ComputeClient, tenancyId *string, os
 	r, err := c.ListImages(ctx, request)
 	return r.Items, err
 }
-
 func getShape(c core.ComputeClient, imageId *string, shapeName string, tenancyId *string) (core.Shape, error) {
 	var shape core.Shape
 	shapes, err := listShapes(ctx, c, imageId, tenancyId)
@@ -1839,8 +2152,6 @@ func getShape(c core.ComputeClient, imageId *string, shapeName string, tenancyId
 	err = errors.New("没有符合条件的Shape")
 	return shape, err
 }
-
-// ListShapes Lists the shapes that can be used to launch an instance within the specified compartment.
 func listShapes(ctx context.Context, c core.ComputeClient, imageID, tenancyId *string) ([]core.Shape, error) {
 	request := core.ListShapesRequest{
 		CompartmentId:   tenancyId,
@@ -1853,8 +2164,6 @@ func listShapes(ctx context.Context, c core.ComputeClient, imageID, tenancyId *s
 	}
 	return r.Items, err
 }
-
-// 列出符合条件的可用性域
 func ListAvailabilityDomains(clients *OciClients) ([]identity.AvailabilityDomain, error) {
 	tenancyId, err := clients.Provider.TenancyOCID()
 	if err != nil {
@@ -1867,7 +2176,6 @@ func ListAvailabilityDomains(clients *OciClients) ([]identity.AvailabilityDomain
 	resp, err := clients.Identity.ListAvailabilityDomains(ctx, req)
 	return resp.Items, err
 }
-
 func ListInstances(ctx context.Context, c core.ComputeClient, tenancyId *string, page *string) ([]core.Instance, *string, error) {
 	req := core.ListInstancesRequest{
 		CompartmentId:   tenancyId,
@@ -1878,7 +2186,6 @@ func ListInstances(ctx context.Context, c core.ComputeClient, tenancyId *string,
 	resp, err := c.ListInstances(ctx, req)
 	return resp.Items, resp.OpcNextPage, err
 }
-
 func ListVnicAttachments(ctx context.Context, c core.ComputeClient, tenancyId *string, instanceId *string, page *string) ([]core.VnicAttachment, *string, error) {
 	req := core.ListVnicAttachmentsRequest{
 		CompartmentId:   tenancyId,
@@ -1892,7 +2199,6 @@ func ListVnicAttachments(ctx context.Context, c core.ComputeClient, tenancyId *s
 	resp, err := c.ListVnicAttachments(ctx, req)
 	return resp.Items, resp.OpcNextPage, err
 }
-
 func GetVnic(c core.VirtualNetworkClient, vnicID *string) (core.Vnic, error) {
 	req := core.GetVnicRequest{
 		VnicId:          vnicID,
@@ -1904,8 +2210,6 @@ func GetVnic(c core.VirtualNetworkClient, vnicID *string) (core.Vnic, error) {
 	}
 	return resp.Vnic, err
 }
-
-// 终止实例
 func terminateInstance(c core.ComputeClient, id *string) error {
 	request := core.TerminateInstanceRequest{
 		InstanceId:         id,
@@ -1915,7 +2219,6 @@ func terminateInstance(c core.ComputeClient, id *string) error {
 	_, err := c.TerminateInstance(ctx, request)
 	return err
 }
-
 func getInstance(c core.ComputeClient, instanceId *string) (core.Instance, error) {
 	req := core.GetInstanceRequest{
 		InstanceId:      instanceId,
@@ -1924,7 +2227,6 @@ func getInstance(c core.ComputeClient, instanceId *string) (core.Instance, error
 	resp, err := c.GetInstance(ctx, req)
 	return resp.Instance, err
 }
-
 func updateInstance(c core.ComputeClient, instanceId *string, displayName *string, ocpus, memoryInGBs *float32,
 	details []core.InstanceAgentPluginConfigDetails, disable *bool) (core.UpdateInstanceResponse, error) {
 	updateInstanceDetails := core.UpdateInstanceDetails{}
@@ -1965,7 +2267,6 @@ func updateInstance(c core.ComputeClient, instanceId *string, displayName *strin
 	}
 	return c.UpdateInstance(ctx, req)
 }
-
 func instanceAction(c core.ComputeClient, instanceId *string, action core.InstanceActionActionEnum) (ins core.Instance, err error) {
 	req := core.InstanceActionRequest{
 		InstanceId:      instanceId,
@@ -1976,7 +2277,6 @@ func instanceAction(c core.ComputeClient, instanceId *string, action core.Instan
 	ins = resp.Instance
 	return
 }
-
 func changePublicIp(clients *OciClients, vnics []core.Vnic) (publicIp core.PublicIp, err error) {
 	var vnic core.Vnic
 	for _, v := range vnics {
@@ -2014,7 +2314,6 @@ func changePublicIp(clients *OciClients, vnics []core.Vnic) (publicIp core.Publi
 	publicIp, err = createPublicIp(clients.Network, privateIp.Id, &tenancyId)
 	return
 }
-
 func getInstanceVnics(clients *OciClients, instanceId *string) (vnics []core.Vnic, err error) {
 	tenancyId, _ := clients.Provider.TenancyOCID()
 	vnicAttachments, _, err := ListVnicAttachments(ctx, clients.Compute, &tenancyId, instanceId, nil)
@@ -2031,8 +2330,6 @@ func getInstanceVnics(clients *OciClients, instanceId *string) (vnics []core.Vni
 	}
 	return
 }
-
-// 获取指定VNIC的私有IP
 func getPrivateIps(c core.VirtualNetworkClient, vnicId *string) ([]core.PrivateIp, error) {
 	req := core.ListPrivateIpsRequest{
 		VnicId:          vnicId,
@@ -2044,8 +2341,6 @@ func getPrivateIps(c core.VirtualNetworkClient, vnicId *string) ([]core.PrivateI
 	}
 	return resp.Items, err
 }
-
-// 获取分配给指定私有IP的公共IP
 func getPublicIp(c core.VirtualNetworkClient, privateIpId *string) (core.PublicIp, error) {
 	req := core.GetPublicIpByPrivateIpIdRequest{
 		GetPublicIpByPrivateIpIdDetails: core.GetPublicIpByPrivateIpIdDetails{PrivateIpId: privateIpId},
@@ -2057,16 +2352,12 @@ func getPublicIp(c core.VirtualNetworkClient, privateIpId *string) (core.PublicI
 	}
 	return resp.PublicIp, err
 }
-
-// 删除公共IP
 func deletePublicIp(c core.VirtualNetworkClient, publicIpId *string) (core.DeletePublicIpResponse, error) {
 	req := core.DeletePublicIpRequest{
 		PublicIpId:      publicIpId,
 		RequestMetadata: getCustomRequestMetadataWithRetryPolicy()}
 	return c.DeletePublicIp(ctx, req)
 }
-
-// 创建公共IP
 func createPublicIp(c core.VirtualNetworkClient, privateIpId *string, tenancyId *string) (core.PublicIp, error) {
 	var publicIp core.PublicIp
 	req := core.CreatePublicIpRequest{
@@ -2081,8 +2372,6 @@ func createPublicIp(c core.VirtualNetworkClient, privateIpId *string, tenancyId 
 	publicIp = resp.PublicIp
 	return publicIp, err
 }
-
-// 根据实例OCID获取公共IP
 func getInstancePublicIps(clients *OciClients, instanceId *string) (ips []string, err error) {
 	// 多次尝试，避免刚抢购到实例，实例正在预配获取不到公共IP。
 	var ins core.Instance
@@ -2123,8 +2412,6 @@ func getInstancePublicIps(clients *OciClients, instanceId *string) (ips []string
 	}
 	return
 }
-
-// 列出引导卷
 func getBootVolumes(c core.BlockstorageClient, availabilityDomain, tenancyId *string) ([]core.BootVolume, error) {
 	req := core.ListBootVolumesRequest{
 		AvailabilityDomain: availabilityDomain,
@@ -2134,8 +2421,6 @@ func getBootVolumes(c core.BlockstorageClient, availabilityDomain, tenancyId *st
 	resp, err := c.ListBootVolumes(ctx, req)
 	return resp.Items, err
 }
-
-// 获取指定引导卷
 func getBootVolume(c core.BlockstorageClient, bootVolumeId *string) (core.BootVolume, error) {
 	req := core.GetBootVolumeRequest{
 		BootVolumeId:    bootVolumeId,
@@ -2144,8 +2429,6 @@ func getBootVolume(c core.BlockstorageClient, bootVolumeId *string) (core.BootVo
 	resp, err := c.GetBootVolume(ctx, req)
 	return resp.BootVolume, err
 }
-
-// 更新引导卷
 func updateBootVolume(c core.BlockstorageClient, bootVolumeId *string, sizeInGBs *int64, vpusPerGB *int64) (core.BootVolume, error) {
 	updateBootVolumeDetails := core.UpdateBootVolumeDetails{}
 	if sizeInGBs != nil {
@@ -2162,8 +2445,6 @@ func updateBootVolume(c core.BlockstorageClient, bootVolumeId *string, sizeInGBs
 	resp, err := c.UpdateBootVolume(ctx, req)
 	return resp.BootVolume, err
 }
-
-// 删除引导卷
 func deleteBootVolume(c core.BlockstorageClient, bootVolumeId *string) (*http.Response, error) {
 	req := core.DeleteBootVolumeRequest{
 		BootVolumeId:    bootVolumeId,
@@ -2172,8 +2453,6 @@ func deleteBootVolume(c core.BlockstorageClient, bootVolumeId *string) (*http.Re
 	resp, err := c.DeleteBootVolume(ctx, req)
 	return resp.RawResponse, err
 }
-
-// 分离引导卷
 func detachBootVolume(c core.ComputeClient, bootVolumeAttachmentId *string) (*http.Response, error) {
 	req := core.DetachBootVolumeRequest{
 		BootVolumeAttachmentId: bootVolumeAttachmentId,
@@ -2182,8 +2461,6 @@ func detachBootVolume(c core.ComputeClient, bootVolumeAttachmentId *string) (*ht
 	resp, err := c.DetachBootVolume(ctx, req)
 	return resp.RawResponse, err
 }
-
-// 获取引导卷附件
 func listBootVolumeAttachments(c core.ComputeClient, availabilityDomain, compartmentId, bootVolumeId *string) ([]core.BootVolumeAttachment, error) {
 	req := core.ListBootVolumeAttachmentsRequest{
 		AvailabilityDomain: availabilityDomain,
@@ -2194,85 +2471,104 @@ func listBootVolumeAttachments(c core.ComputeClient, availabilityDomain, compart
 	resp, err := c.ListBootVolumeAttachments(ctx, req)
 	return resp.Items, err
 }
-
-func sendMessage(name, text string) (msg Message, err error) {
-	if appConfig.token != "" && appConfig.chat_id != "" {
-		data := url.Values{
-			"parse_mode": {"Markdown"},
-			"chat_id":    {appConfig.chat_id},
-			"text":       {"🔰*甲骨文通知* " + name + "\n" + text},
-		}
-		var req *http.Request
-		req, err = http.NewRequest(http.MethodPost, appConfig.sendMessageUrl, strings.NewReader(data.Encode()))
-		if err != nil {
-			return
-		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		client := common.BaseClient{HTTPClient: &http.Client{}}
-		setProxyOrNot(&client)
-		var resp *http.Response
-		resp, err = client.HTTPClient.Do(req)
-		if err != nil {
-			return
-		}
-		defer resp.Body.Close()
-		var body []byte
-		body, err = ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return
-		}
-		err = json.Unmarshal(body, &msg)
-		if err != nil {
-			return
-		}
-		if !msg.OK {
-			err = errors.New(msg.Description)
-			return
-		}
+func sendMessage(chatId, name, text string, keyboard *InlineKeyboardMarkup) (msg Message, err error) {
+	if appConfig.token == "" || chatId == "" {
+		return Message{}, errors.New("token或chat_id为空")
 	}
+
+	data := url.Values{
+		"parse_mode": {"Markdown"},
+		"chat_id":    {chatId},
+		"text":       {"🔰*甲骨文通知* " + name + "\n" + text},
+	}
+
+	if keyboard != nil {
+		keyboardBytes, _ := json.Marshal(keyboard)
+		data.Set("reply_markup", string(keyboardBytes))
+	}
+
+	req, err := http.NewRequest(http.MethodPost, appConfig.sendMessageUrl, strings.NewReader(data.Encode()))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	client := getTgClient()
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	var body []byte
+	body, err = ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+	err = json.Unmarshal(body, &msg)
+	if err != nil {
+		return
+	}
+	if !msg.OK {
+		err = errors.New(msg.Description)
+		return
+	}
+
 	return
 }
-
-func editMessage(messageId int, name, text string) (msg Message, err error) {
-	if appConfig.token != "" && appConfig.chat_id != "" {
-		data := url.Values{
-			"parse_mode": {"Markdown"},
-			"chat_id":    {appConfig.chat_id},
-			"message_id": {strconv.Itoa(messageId)},
-			"text":       {"🔰*甲骨文通知* " + name + "\n" + text},
+func editMessage(messageId int, chatId, name, text string, keyboard *InlineKeyboardMarkup) (msg Message, err error) {
+	if appConfig.token == "" || chatId == "" {
+		if messageId == 0 {
+			return sendMessage(chatId, name, text, keyboard)
 		}
-		var req *http.Request
-		req, err = http.NewRequest(http.MethodPost, appConfig.editMessageUrl, strings.NewReader(data.Encode()))
-		if err != nil {
-			return
-		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		client := common.BaseClient{HTTPClient: &http.Client{}}
-		setProxyOrNot(&client)
-		var resp *http.Response
-		resp, err = client.HTTPClient.Do(req)
-		if err != nil {
-			return
-		}
-		defer resp.Body.Close()
-		var body []byte
-		body, err = ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return
-		}
-		err = json.Unmarshal(body, &msg)
-		if err != nil {
-			return
-		}
-		if !msg.OK {
-			err = errors.New(msg.Description)
-			return
-		}
-
+		return Message{}, errors.New("token或chat_id为空")
 	}
+
+	data := url.Values{
+		"parse_mode": {"Markdown"},
+		"chat_id":    {chatId},
+		"message_id": {strconv.Itoa(messageId)},
+		"text":       {"🔰*甲骨文通知* " + name + "\n" + text},
+	}
+
+	if keyboard != nil {
+		keyboardBytes, _ := json.Marshal(keyboard)
+		data.Set("reply_markup", string(keyboardBytes))
+	} else {
+		emptyKeyboard := InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}}
+		keyboardBytes, _ := json.Marshal(emptyKeyboard)
+		data.Set("reply_markup", string(keyboardBytes))
+	}
+
+	req, err := http.NewRequest(http.MethodPost, appConfig.editMessageUrl, strings.NewReader(data.Encode()))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	client := getTgClient()
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	var body []byte
+	body, err = ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+	err = json.Unmarshal(body, &msg)
+	if err != nil {
+		return
+	}
+	if !msg.OK {
+		if !strings.Contains(msg.Description, "message is not modified") {
+			err = errors.New(msg.Description)
+		} else {
+			err = nil
+		}
+		return
+	}
+
 	return
 }
-
 func setProxyOrNot(client *common.BaseClient) {
 	if appConfig.proxy != "" {
 		proxyURL, err := url.Parse(appConfig.proxy)
@@ -2287,7 +2583,6 @@ func setProxyOrNot(client *common.BaseClient) {
 		}
 	}
 }
-
 func getInstanceState(state core.InstanceLifecycleStateEnum) string {
 	var friendlyState string
 	switch state {
@@ -2312,7 +2607,6 @@ func getInstanceState(state core.InstanceLifecycleStateEnum) string {
 	}
 	return friendlyState
 }
-
 func getBootVolumeState(state core.BootVolumeLifecycleStateEnum) string {
 	var friendlyState string
 	switch state {
@@ -2333,7 +2627,6 @@ func getBootVolumeState(state core.BootVolumeLifecycleStateEnum) string {
 	}
 	return friendlyState
 }
-
 func fmtDuration(d time.Duration) string {
 	if d.Seconds() < 1 {
 		return "< 1 秒"
@@ -2359,22 +2652,18 @@ func fmtDuration(d time.Duration) string {
 	}
 	return buffer.String()
 }
-
 func printf(format string, a ...interface{}) {
 	fmt.Printf("%s ", time.Now().Format("2006-01-02 15:04:05"))
 	fmt.Printf(format, a...)
 }
-
 func printlnErr(desc, detail string) {
 	fmt.Printf("\033[1;31mError: %s. %s\033[0m\n", desc, detail)
 }
-
 func getCustomRequestMetadataWithRetryPolicy() common.RequestMetadata {
 	return common.RequestMetadata{
 		RetryPolicy: getCustomRetryPolicy(),
 	}
 }
-
 func getCustomRetryPolicy() *common.RetryPolicy {
 	// how many times to do the retry
 	attempts := uint(3)
@@ -2387,7 +2676,6 @@ func getCustomRetryPolicy() *common.RetryPolicy {
 		common.WithShouldRetryOperation(retryOnAllNon200ResponseCodes))
 	return &policy
 }
-
 func command(cmd string) {
 	res := strings.Fields(cmd)
 	if len(res) > 0 {
@@ -2402,12 +2690,6 @@ func command(cmd string) {
 		}
 	}
 }
-
-// =================================================================
-// ==================== 新增/优化功能实现 ==========================
-// =================================================================
-
-// -------------------- 管理员管理 --------------------
 func (app *App) manageAdmins() {
 	for {
 		fmt.Printf("\n\033[1;32m管理员管理\033[0m \n(当前账号: %s)\n\n", app.oracleSectionName)
@@ -2432,7 +2714,6 @@ func (app *App) manageAdmins() {
 		}
 	}
 }
-
 func (app *App) listAdmins() {
 	fmt.Println("正在获取用户列表...")
 	req := identity.ListUsersRequest{CompartmentId: &app.oracleConfig.Tenancy}
@@ -2479,7 +2760,6 @@ func (app *App) listAdmins() {
 
 	app.adminDetails(resp.Items[index-1])
 }
-
 func (app *App) adminDetails(user identity.User) {
 	for {
 		name := "N/A"
@@ -2528,7 +2808,6 @@ func (app *App) adminDetails(user identity.User) {
 		}
 	}
 }
-
 func (app *App) createAdmin() {
 	var name, description, email string
 	fmt.Print("请输入新管理员用户名 (必须是邮箱格式): ")
@@ -2578,7 +2857,6 @@ func (app *App) createAdmin() {
 	fmt.Printf("\033[1;32m成功将用户 '%s' 添加到 'Administrators' 组，已赋予完全管理权限。\033[0m\n", *userResp.User.Name)
 	fmt.Println("用户需要检查邮箱并设置密码才能登录。")
 }
-
 func (app *App) updateAdmin(user identity.User) {
 	var description, email string
 
@@ -2618,7 +2896,6 @@ func (app *App) updateAdmin(user identity.User) {
 	}
 	fmt.Println("\033[1;32m用户信息更新成功！\033[0m")
 }
-
 func (app *App) deleteAdmin(user identity.User) {
 	userName := "N/A"
 	if user.Name != nil {
@@ -2641,8 +2918,6 @@ func (app *App) deleteAdmin(user identity.User) {
 	}
 	fmt.Printf("\033[1;32m用户 '%s' 已成功删除。\033[0m\n", userName)
 }
-
-// -------------------- 网络管理 --------------------
 func (app *App) manageNetwork() {
 	for {
 		fmt.Printf("\n\033[1;32m网络管理\033[0m \n(当前账号: %s)\n\n", app.oracleSectionName)
@@ -2667,7 +2942,6 @@ func (app *App) manageNetwork() {
 		}
 	}
 }
-
 func (app *App) listAllSubnets() {
 	fmt.Println("正在获取子网列表...")
 	subnets, err := listSubnets(ctx, app.clients.Network, nil, &app.oracleConfig.Tenancy) // nil VCN ID to list all
@@ -2697,7 +2971,6 @@ func (app *App) listAllSubnets() {
 	w.Flush()
 	// TODO: Add modification logic if needed
 }
-
 func (app *App) listAllSecurityLists() {
 	fmt.Println("正在获取安全列表...")
 	req := core.ListSecurityListsRequest{CompartmentId: &app.oracleConfig.Tenancy}
@@ -2739,7 +3012,6 @@ func (app *App) listAllSecurityLists() {
 	}
 	app.securityListDetails(resp.Items[index-1])
 }
-
 func (app *App) securityListDetails(sl core.SecurityList) {
 	fmt.Printf("\n\033[1;32m入站规则 for %s\033[0m\n", *sl.DisplayName)
 	iw := new(tabwriter.Writer)
@@ -2760,20 +3032,16 @@ func (app *App) securityListDetails(sl core.SecurityList) {
 	ew.Flush()
 	// TODO: Add rule modification logic
 }
-
 func getSubnet(c core.VirtualNetworkClient, subnetId *string) (core.Subnet, error) {
 	req := core.GetSubnetRequest{SubnetId: subnetId}
 	resp, err := c.GetSubnet(ctx, req)
 	return resp.Subnet, err
 }
-
 func getVcn(c core.VirtualNetworkClient, vcnId *string) (core.Vcn, error) {
 	req := core.GetVcnRequest{VcnId: vcnId}
 	resp, err := c.GetVcn(ctx, req)
 	return resp.Vcn, err
 }
-
-// -------------------- 流量查看 (优化) --------------------
 func (app *App) viewInstanceTraffic(instanceId *string) {
 	for {
 		fmt.Printf("\n\033[1;32m查看实例流量\033[0m\n")
@@ -2829,7 +3097,6 @@ func (app *App) viewInstanceTraffic(instanceId *string) {
 		app.queryTraffic(instanceId, startTime, endTime, resolution)
 	}
 }
-
 func (app *App) queryTraffic(instanceId *string, startTime, endTime time.Time, resolution string) {
 	fmt.Println("正在查询流量数据，请稍候...")
 	namespace := "oci_computeagent"
@@ -2864,7 +3131,6 @@ func (app *App) queryTraffic(instanceId *string, startTime, endTime time.Time, r
 	fmt.Printf("总出站流量 (Uploaded):   %s\n", formatBytes(totalOut))
 	fmt.Printf("总计使用流量:           %s\n", formatBytes(totalIn+totalOut))
 }
-
 func getMetrics(c monitoring.MonitoringClient, tenancyId *string, namespace, query string, startTime, endTime time.Time, resolution string) (monitoring.SummarizeMetricsDataResponse, error) {
 	req := monitoring.SummarizeMetricsDataRequest{
 		CompartmentId: tenancyId,
@@ -2878,7 +3144,6 @@ func getMetrics(c monitoring.MonitoringClient, tenancyId *string, namespace, que
 	}
 	return c.SummarizeMetricsData(ctx, req)
 }
-
 func formatBytes(b float64) string {
 	const unit = 1024
 	if b < unit {
@@ -2891,8 +3156,6 @@ func formatBytes(b float64) string {
 	}
 	return fmt.Sprintf("%.2f %cB", b/float64(div), "KMGTPE"[exp])
 }
-
-// -------------------- 租户与用户信息 --------------------
 func (app *App) manageTenantAndUser() {
 	for {
 		fmt.Printf("\n\033[1;32m租户与用户信息\033[0m\n")
@@ -2917,7 +3180,6 @@ func (app *App) manageTenantAndUser() {
 		}
 	}
 }
-
 func (app *App) showTenantDetails() {
 	fmt.Println("正在获取租户信息...")
 	req := identity.GetTenancyRequest{TenancyId: &app.oracleConfig.Tenancy}
@@ -2933,23 +3195,18 @@ func (app *App) showTenantDetails() {
 	fmt.Fprintf(w, "名称:\t%s\n", *resp.Tenancy.Name)
 	fmt.Fprintf(w, "ID:\t%s\n", *resp.Tenancy.Id)
 	fmt.Fprintf(w, "主区域:\t%s\n", *resp.Tenancy.HomeRegionKey)
-	// The TimeCreated field is not available in the Tenancy struct in the SDK for v65.
-	// fmt.Fprintf(w, "创建时间:\t%s\n", resp.Tenancy.TimeCreated.Format(timeLayout))
 	if resp.Tenancy.Description != nil {
 		fmt.Fprintf(w, "描述:\t%s\n", *resp.Tenancy.Description)
 	}
 	w.Flush()
 }
-
 func (app *App) updateMyRecoveryEmail() {
-	// First, get the current user's ID from the config provider
 	userId, err := app.clients.Provider.UserOCID()
 	if err != nil {
 		printlnErr("无法从配置文件中获取用户ID", err.Error())
 		return
 	}
 
-	// Get current user details to show current email
 	userResp, err := app.clients.Identity.GetUser(ctx, identity.GetUserRequest{UserId: &userId})
 	if err != nil {
 		printlnErr("获取当前用户信息失败", err.Error())
@@ -2983,8 +3240,6 @@ func (app *App) updateMyRecoveryEmail() {
 	}
 	fmt.Println("\033[1;32m恢复邮箱更新成功！\033[0m")
 }
-
-// -------------------- 新增：IPv6 添加能力 --------------------
 func (app *App) addIpv6ToInstance(vnics []core.Vnic) {
 	if len(vnics) == 0 {
 		fmt.Printf("\033[1;31m实例已终止或获取实例VNIC失败，请稍后重试.\033[0m\n")
@@ -3026,14 +3281,11 @@ func (app *App) addIpv6ToInstance(vnics []core.Vnic) {
 	fmt.Printf("\033[1;32m成功为实例添加IPv6地址: %s\033[0m\n", *resp.Ipv6.IpAddress)
 	fmt.Println("注意：您可能需要在操作系统内部配置网络以使用此IPv6地址。")
 }
-
 func listIpv6s(c core.VirtualNetworkClient, vnicId *string) ([]core.Ipv6, error) {
 	req := core.ListIpv6sRequest{VnicId: vnicId}
 	resp, err := c.ListIpv6s(ctx, req)
 	return resp.Items, err
 }
-
-// -------------------- 租户管理 (凭证检查) --------------------
 func (app *App) manageTenants() {
 	for {
 		fmt.Printf("\n\033[1;32m租户管理 (凭证检查)\033[0m \n(当前账号: %s)\n\n", app.oracleSectionName)
@@ -3052,13 +3304,12 @@ func (app *App) manageTenants() {
 		case 1:
 			app.checkCurrentTenantActivity()
 		case 2:
-			app.checkAllTenantsActivity()
+			app.checkAllTenantsActivity(false) // false for CLI mode
 		default:
 			fmt.Println("\033[1;31m输入无效\033[0m")
 		}
 	}
 }
-
 func (app *App) checkCurrentTenantActivity() {
 	fmt.Println("正在检查当前租户凭证和活动状态...")
 	req := identity.GetTenancyRequest{TenancyId: &app.oracleConfig.Tenancy}
@@ -3079,9 +3330,10 @@ func (app *App) checkCurrentTenantActivity() {
 	fmt.Println("\n按回车键返回...")
 	fmt.Scanln()
 }
-
-func (app *App) checkAllTenantsActivity() {
-	fmt.Println("正在一键检查所有租户的凭证...")
+func (app *App) checkAllTenantsActivity(botMode bool) string {
+	if !botMode {
+		fmt.Println("正在一键检查所有租户的凭证...")
+	}
 
 	var wg sync.WaitGroup
 	resultsChan := make(chan TenantStatus, len(app.oracleSections))
@@ -3094,19 +3346,19 @@ func (app *App) checkAllTenantsActivity() {
 			var oracleConfig Oracle
 			err := sec.MapTo(&oracleConfig)
 			if err != nil {
-				resultsChan <- TenantStatus{Name: sec.Name(), Status: "\033[1;31m无效\033[0m", Message: "配置文件解析失败"}
+				resultsChan <- TenantStatus{Name: sec.Name(), Status: "无效", Message: "配置文件解析失败"}
 				return
 			}
 
 			provider, err := getProvider(oracleConfig)
 			if err != nil {
-				resultsChan <- TenantStatus{Name: sec.Name(), Status: "\033[1;31m无效\033[0m", Message: "获取Provider失败: " + err.Error()}
+				resultsChan <- TenantStatus{Name: sec.Name(), Status: "无效", Message: "获取Provider失败: " + err.Error()}
 				return
 			}
 
 			identityClient, err := identity.NewIdentityClientWithConfigurationProvider(provider)
 			if err != nil {
-				resultsChan <- TenantStatus{Name: sec.Name(), Status: "\033[1;31m无效\033[0m", Message: "创建IdentityClient失败: " + err.Error()}
+				resultsChan <- TenantStatus{Name: sec.Name(), Status: "无效", Message: "创建IdentityClient失败: " + err.Error()}
 				return
 			}
 			setProxyOrNot(&identityClient.BaseClient)
@@ -3114,19 +3366,17 @@ func (app *App) checkAllTenantsActivity() {
 			_, err = identityClient.GetTenancy(ctx, identity.GetTenancyRequest{TenancyId: &oracleConfig.Tenancy})
 			if err != nil {
 				var errMsg string
-				// 检查是否为 OCI 服务错误
 				if serviceError, ok := common.IsServiceError(err); ok {
 					errMsg = fmt.Sprintf("%s (状态码: %d, 服务码: %s)",
 						serviceError.GetMessage(),
 						serviceError.GetHTTPStatusCode(),
 						serviceError.GetCode())
 				} else {
-					// 其他错误 (例如文件未找到, 网络问题)
 					errMsg = err.Error()
 				}
-				resultsChan <- TenantStatus{Name: sec.Name(), Status: "\033[1;31m无效\033[0m", Message: errMsg}
+				resultsChan <- TenantStatus{Name: sec.Name(), Status: "无效", Message: errMsg}
 			} else {
-				resultsChan <- TenantStatus{Name: sec.Name(), Status: "\033[1;32m有效\033[0m", Message: "凭证有效"}
+				resultsChan <- TenantStatus{Name: sec.Name(), Status: "有效", Message: "凭证有效"}
 			}
 		}(section)
 	}
@@ -3139,15 +3389,44 @@ func (app *App) checkAllTenantsActivity() {
 		results = append(results, res)
 	}
 
-	fmt.Printf("\n\033[1;32m所有租户凭证检查结果\033[0m\n")
+	// Format output
+	var sb strings.Builder
+	if botMode {
+		sb.WriteString("```\n") // Use markdown code block for better formatting in TG
+	} else {
+		fmt.Printf("\n\033[1;32m所有租户凭证检查结果\033[0m\n")
+	}
+
 	w := new(tabwriter.Writer)
-	w.Init(os.Stdout, 0, 8, 2, '\t', 0)
+	w.Init(&sb, 0, 8, 2, ' ', tabwriter.Debug)
 	fmt.Fprintln(w, "租户名称\t状态\t信息")
 	fmt.Fprintln(w, "--------\t----\t----")
 	for _, res := range results {
-		fmt.Fprintf(w, "%s\t%s\t%s\n", res.Name, res.Status, res.Message)
+		status := res.Status
+		if !botMode {
+			if status == "有效" {
+				status = "\033[1;32m有效\033[0m"
+			} else {
+				status = "\033[1;31m无效\033[0m"
+			}
+		} else {
+			if res.Status == "有效" {
+				status = "✅ " + status
+			} else {
+				status = "❌ " + status
+			}
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\n", res.Name, status, res.Message)
 	}
 	w.Flush()
-	fmt.Println("\n按回车键返回...")
-	fmt.Scanln()
+
+	if botMode {
+		sb.WriteString("```")
+		return sb.String()
+	} else {
+		fmt.Println(sb.String())
+		fmt.Println("\n按回车键返回...")
+		fmt.Scanln()
+		return ""
+	}
 }
