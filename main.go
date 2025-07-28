@@ -40,6 +40,7 @@ import (
 	"io/ioutil"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -1470,100 +1471,158 @@ func CreateOrGetNetworkInfrastructure(ctx context.Context, c core.VirtualNetwork
 	return
 }
 
-// CreateOrGetSubnetWithDetails either creates a new Virtual Cloud Network (VCN) or get the one already exist
-// with detail info
+// CreateOrGetSubnetWithDetails either creates a new subnet or gets an existing one.
+// It prioritizes reusing existing subnets. If creation is necessary, it handles CIDR conflicts.
 func createOrGetSubnetWithDetails(ctx context.Context, c core.VirtualNetworkClient, vcnID *string,
 	displayName *string, cidrBlock *string, dnsLabel *string, availableDomain *string, tenancyId *string) (subnet core.Subnet, err error) {
+
+	// 1. List existing subnets in the VCN
 	var subnets []core.Subnet
 	subnets, err = listSubnets(ctx, c, vcnID, tenancyId)
 	if err != nil {
-		return
+		return subnet, fmt.Errorf("failed to list subnets: %w", err)
 	}
 
-	if displayName == nil || *displayName == "" {
-		displayName = common.String("subnet-" + time.Now().Format("20060102-1504"))
-	}
-
-	if len(subnets) > 0 && (displayName == nil || *displayName == "") {
-		subnet = subnets[0]
-		return
-	}
-
-	// check if the subnet has already been created
-	for _, element := range subnets {
-		if *element.DisplayName == *displayName {
-			// find the subnet, return it
-			subnet = element
-			return
+	// 2. If a specific display name is provided in the config, try to find it.
+	if displayName != nil && *displayName != "" {
+		for _, s := range subnets {
+			if s.DisplayName != nil && *s.DisplayName == *displayName {
+				fmt.Printf("找到并复用已存在的子网: %s\n", *s.DisplayName)
+				return s, nil
+			}
+		}
+		// If not found by name, it will fall through to the creation logic.
+	} else {
+		// 3. If no name is provided, and subnets exist, reuse the first one found.
+		if len(subnets) > 0 {
+			fmt.Printf("未指定子网名称，找到并复用第一个可用的子网: %s\n", *subnets[0].DisplayName)
+			return subnets[0], nil
 		}
 	}
 
-	// create a new subnet
+	// 4. If no suitable subnet is found, proceed to create a new one.
 	fmt.Printf("开始创建Subnet（没有可用的Subnet，或指定的Subnet不存在）\n")
-	request := core.CreateSubnetRequest{}
-	//request.AvailabilityDomain = availableDomain //省略此属性创建区域性子网(regional subnet)，提供此属性创建特定于可用性域的子网。建议创建区域性子网。
-	request.CompartmentId = tenancyId
-	request.CidrBlock = cidrBlock
-	request.DisplayName = displayName
-	request.DnsLabel = dnsLabel
-	request.RequestMetadata = getCustomRequestMetadataWithRetryPolicy()
 
-	request.VcnId = vcnID
-	var r core.CreateSubnetResponse
-	r, err = c.CreateSubnet(ctx, request)
-	if err != nil {
-		return
+	// Generate a name for the new subnet if one wasn't provided.
+	var creationDisplayName *string
+	if displayName != nil && *displayName != "" {
+		creationDisplayName = displayName
+	} else {
+		creationDisplayName = common.String("subnet-" + time.Now().Format("20060102-1504"))
 	}
-	// retry condition check, stop unitl return true
-	pollUntilAvailable := func(r common.OCIOperationResponse) bool {
-		if converted, ok := r.Response.(core.GetSubnetResponse); ok {
-			return converted.LifecycleState != core.SubnetLifecycleStateAvailable
+
+	// 5. Attempt to create the subnet, handling CIDR conflicts by trying subsequent blocks.
+	baseCidr := "10.0.0.0/20"
+	if cidrBlock != nil && *cidrBlock != "" {
+		baseCidr = *cidrBlock
+	}
+
+	for i := 0; i < 16; i++ { // Try up to 16 times for a /16 VCN range
+		request := core.CreateSubnetRequest{
+			CreateSubnetDetails: core.CreateSubnetDetails{
+				CompartmentId: tenancyId,
+				CidrBlock:     &baseCidr,
+				DisplayName:   creationDisplayName,
+				DnsLabel:      dnsLabel,
+				VcnId:         vcnID,
+			},
+			RequestMetadata: getCustomRequestMetadataWithRetryPolicy(),
 		}
-		return true
+
+		var r core.CreateSubnetResponse
+		r, err = c.CreateSubnet(ctx, request)
+
+		if err == nil {
+			// Success, now poll until the subnet is 'Available'
+			pollUntilAvailable := func(r common.OCIOperationResponse) bool {
+				if converted, ok := r.Response.(core.GetSubnetResponse); ok {
+					return converted.LifecycleState != core.SubnetLifecycleStateAvailable
+				}
+				return true
+			}
+
+			pollGetRequest := core.GetSubnetRequest{
+				SubnetId:        r.Id,
+				RequestMetadata: helpers.GetRequestMetadataWithCustomizedRetryPolicy(pollUntilAvailable),
+			}
+
+			_, err = c.GetSubnet(ctx, pollGetRequest)
+			if err != nil {
+				return subnet, err // return error from polling
+			}
+
+			// Update the security list to allow all ingress traffic
+			getReq := core.GetSecurityListRequest{
+				SecurityListId:  common.String(r.SecurityListIds[0]),
+				RequestMetadata: getCustomRequestMetadataWithRetryPolicy(),
+			}
+
+			var getResp core.GetSecurityListResponse
+			getResp, err = c.GetSecurityList(ctx, getReq)
+			if err != nil {
+				return subnet, err // return error from getting security list
+			}
+
+			newRules := append(getResp.IngressSecurityRules, core.IngressSecurityRule{
+				Protocol: common.String("all"), // Allow all protocols
+				Source:   common.String("0.0.0.0/0"),
+			})
+
+			updateReq := core.UpdateSecurityListRequest{
+				SecurityListId: common.String(r.SecurityListIds[0]),
+				UpdateSecurityListDetails: core.UpdateSecurityListDetails{
+					IngressSecurityRules: newRules,
+				},
+				RequestMetadata: getCustomRequestMetadataWithRetryPolicy(),
+			}
+
+			_, err = c.UpdateSecurityList(ctx, updateReq)
+			if err != nil {
+				return subnet, err // return error from updating security list
+			}
+			fmt.Printf("Subnet创建成功: %s\n", *r.Subnet.DisplayName)
+			subnet = r.Subnet
+			return subnet, nil // Return the successfully created subnet
+		}
+
+		// Check if the error is a CIDR overlap conflict
+		if serviceError, ok := common.IsServiceError(err); ok {
+			if serviceError.GetHTTPStatusCode() == 400 && strings.Contains(serviceError.GetMessage(), "overlaps with this CIDR") {
+				printf("CIDR %s overlaps. Trying next CIDR...\n", baseCidr)
+
+				// Calculate the next CIDR block. For a /20, the third octet increments by 16.
+				var ip net.IP
+				var ipnet *net.IPNet
+				ip, ipnet, err = net.ParseCIDR(baseCidr)
+				if err != nil {
+					return subnet, fmt.Errorf("failed to parse CIDR for retry logic: %w", err)
+				}
+				ip = ip.To4()
+				if ip == nil {
+					return subnet, errors.New("failed to parse CIDR to IPv4 for retry logic")
+				}
+
+				// Increment the third octet.
+				ip[2] += 16
+
+				// Check for overflow on the third octet (e.g., 10.0.240.0 -> 10.1.0.0)
+				if ip[2] < 16 { // it wrapped around
+					return subnet, errors.New("ran out of available CIDR blocks in 10.0.0.0/16 range")
+				}
+
+				// Reconstruct CIDR string with the same mask size
+				_, mask := ipnet.Mask.Size()
+				baseCidr = fmt.Sprintf("%s/%d", ip.String(), mask)
+				continue // Retry with the new CIDR
+			}
+		}
+
+		// If it's a different, non-recoverable error, fail immediately
+		return subnet, err
 	}
 
-	pollGetRequest := core.GetSubnetRequest{
-		SubnetId:        r.Id,
-		RequestMetadata: helpers.GetRequestMetadataWithCustomizedRetryPolicy(pollUntilAvailable),
-	}
-
-	// wait for lifecyle become running
-	_, err = c.GetSubnet(ctx, pollGetRequest)
-	if err != nil {
-		return
-	}
-
-	// update the security rules
-	getReq := core.GetSecurityListRequest{
-		SecurityListId:  common.String(r.SecurityListIds[0]),
-		RequestMetadata: getCustomRequestMetadataWithRetryPolicy(),
-	}
-
-	var getResp core.GetSecurityListResponse
-	getResp, err = c.GetSecurityList(ctx, getReq)
-	if err != nil {
-		return
-	}
-
-	newRules := append(getResp.IngressSecurityRules, core.IngressSecurityRule{
-		Protocol: common.String("all"), // 允许所有协议
-		Source:   common.String("0.0.0.0/0"),
-	})
-
-	updateReq := core.UpdateSecurityListRequest{
-		SecurityListId:  common.String(r.SecurityListIds[0]),
-		RequestMetadata: getCustomRequestMetadataWithRetryPolicy(),
-	}
-
-	updateReq.IngressSecurityRules = newRules
-
-	_, err = c.UpdateSecurityList(ctx, updateReq)
-	if err != nil {
-		return
-	}
-	fmt.Printf("Subnet创建成功: %s\n", *r.Subnet.DisplayName)
-	subnet = r.Subnet
-	return
+	// If the loop finishes without successfully creating a subnet
+	return subnet, fmt.Errorf("failed to create a subnet after multiple attempts: %w", err)
 }
 
 // 列出指定虚拟云网络 (VCN) 中的所有子网
