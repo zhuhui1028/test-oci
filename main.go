@@ -66,7 +66,7 @@ const (
 	timeLayout        = "2006-01-02 15:04:05"
 )
 
-// Global application configuration
+// 全局应用配置
 var (
 	appConfig struct {
 		proxy          string
@@ -82,12 +82,12 @@ var (
 	ctx             = context.Background()
 	cfg             *ini.File
 	taskManager     *TaskManager
-	selectedTenants = make(map[int64]string) // Stores the selected tenant for each chat ID
-	userNextAction  = make(map[int64]string) // Stores the next expected action for a user
-	mu              sync.Mutex               // To protect concurrent map access
+	selectedTenants = make(map[int64]string) // 存储每个聊天的已选租户
+	userNextAction  = make(map[int64]string) // 存储用户的下一个预期操作
+	mu              sync.RWMutex             // 用于保护并发访问map
 )
 
-// OCI configuration for a single account
+// 单个OCI账户的配置
 type Oracle struct {
 	User         string `ini:"user"`
 	Fingerprint  string `ini:"fingerprint"`
@@ -97,7 +97,7 @@ type Oracle struct {
 	Key_password string `ini:"key_password"`
 }
 
-// Instance configuration parameters from INI file
+// INI文件中的实例配置参数
 type Instance struct {
 	AvailabilityDomain     string  `ini:"availabilityDomain"`
 	SSH_Public_Key         string  `ini:"ssh_authorized_key"`
@@ -119,7 +119,7 @@ type Instance struct {
 	MaxTime                int32   `ini:"maxTime"`
 }
 
-// Telegram message structure
+// Telegram消息结构体
 type Message struct {
 	OK          bool `json:"ok"`
 	Result      `json:"result"`
@@ -130,7 +130,7 @@ type Result struct {
 	MessageId int `json:"message_id"`
 }
 
-// OciClients holds all necessary OCI service clients.
+// OciClients 包含所有必需的OCI服务客户端
 type OciClients struct {
 	Compute    core.ComputeClient
 	Network    core.VirtualNetworkClient
@@ -140,7 +140,7 @@ type OciClients struct {
 	Provider   common.ConfigurationProvider
 }
 
-// App holds the application state.
+// App 包含应用程序的状态
 type App struct {
 	clients             *OciClients
 	oracleConfig        Oracle
@@ -151,14 +151,14 @@ type App struct {
 	instanceBaseSection *ini.Section
 }
 
-// TenantStatus holds the result of a single tenant's credential check.
+// TenantStatus 包含单个租户凭证检查的结果
 type TenantStatus struct {
 	Name    string
 	Status  string
 	Message string
 }
 
-// ############# Telegram Bot API Structures #############
+// ############# Telegram Bot API 结构体 #############
 type TgUpdate struct {
 	UpdateId      int            `json:"update_id"`
 	Message       *TgMessage     `json:"message"`
@@ -194,7 +194,7 @@ type InlineKeyboardButton struct {
 	CallbackData string `json:"callback_data"`
 }
 
-// ############# Task Management Structures #############
+// ############# 任务管理结构体 #############
 type CreationTask struct {
 	ID                   string
 	TenantName           string
@@ -260,7 +260,7 @@ func (tm *TaskManager) List() []*CreationTask {
 	for _, task := range tm.tasks {
 		tasks = append(tasks, task)
 	}
-	// Sort by start time
+	// 按开始时间排序
 	sort.Slice(tasks, func(i, j int) bool {
 		return tasks[i].StartTime.Before(tasks[j].StartTime)
 	})
@@ -287,7 +287,7 @@ func main() {
 			fmt.Println("\033[1;31m错误: Bot模式需要设置Telegram token。\033[0m")
 			os.Exit(1)
 		}
-		taskManager = NewTaskManager() // Initialize the task manager
+		taskManager = NewTaskManager() // 初始化任务管理器
 		fmt.Println("以Telegram Bot模式启动...")
 		startBot()
 	} else {
@@ -347,7 +347,7 @@ func (app *App) run() {
 	}
 }
 
-// ############# Telegram Bot Core Logic #############
+// ############# Telegram Bot 核心逻辑 #############
 
 func getTgClient() *http.Client {
 	client := &http.Client{Timeout: 40 * time.Second}
@@ -436,10 +436,19 @@ func handleUpdate(update TgUpdate) {
 }
 
 func handleMessage(msg *TgMessage) {
-	fmt.Printf("收到消息: %s 来自 Chat ID: %d\n", msg.Text, msg.Chat.Id)
-	chatIdStr := strconv.FormatInt(msg.Chat.Id, 10)
+	chatId := msg.Chat.Id
+	chatIdStr := strconv.FormatInt(chatId, 10)
+	fmt.Printf("收到消息: %s 来自 Chat ID: %d\n", msg.Text, chatId)
 
-	// Check for commands that might be part of a callback
+	// 检查是否有待处理的用户输入
+	mu.RLock()
+	action, ok := userNextAction[chatId]
+	mu.RUnlock()
+	if ok {
+		handleUserInput(msg, action)
+		return
+	}
+
 	command := msg.Text
 	if strings.HasPrefix(command, "/") {
 		parts := strings.Split(command, " ")
@@ -448,62 +457,61 @@ func handleMessage(msg *TgMessage) {
 
 	switch command {
 	case "/start", "/menu":
-		sendMainMenuKeyboard(chatIdStr)
-	case "/create":
-		sendTenantSelectionKeyboard(chatIdStr, "create_tenant", msg.MessageId)
-	case "/check_tenants":
-		go func() {
-			checkingMsg, err := sendMessage(chatIdStr, "", "正在检查所有租户凭证状态，请稍候...", nil)
-			if err != nil {
-				printlnErr("发送'检查租户'初始消息失败", err.Error())
-				return
-			}
-			app := &App{}
-			app.loadOracleSections(cfg)
-			resultText := app.checkAllTenantsActivity(true)
-			editMessage(checkingMsg.MessageId, chatIdStr, "所有租户凭证检查完成:", resultText, buildMainMenuKeyboard())
-		}()
+		sendMessage(chatIdStr, "", "欢迎使用OCI助手机器人! 请选择一个操作:", buildMainMenuKeyboard())
 	case "/list_tasks":
-		sendTaskListKeyboard(chatIdStr, msg.MessageId)
-	case "/list_instances":
-		sendTenantSelectionKeyboard(chatIdStr, "list_instances_tenant", msg.MessageId)
+		sendTaskListKeyboard(chatIdStr, 0)
 	default:
 		sendMessage(chatIdStr, "", "未知命令。使用 /menu 查看主菜单。", nil)
 	}
 }
 
 func handleCallbackQuery(cb *CallbackQuery) {
-	// Acknowledge the callback immediately to make the button responsive.
 	answerCallbackQuery(cb.Id)
 
-	chatIdStr := strconv.FormatInt(cb.Message.Chat.Id, 10)
+	chatId := cb.Message.Chat.Id
+	chatIdStr := strconv.FormatInt(chatId, 10)
+	messageId := cb.Message.MessageId
 	parts := strings.Split(cb.Data, ":")
-	if len(parts) < 1 {
-		return
-	}
 	action := parts[0]
-
-	// Handle text commands sent via buttons
-	if strings.HasPrefix(action, "/") {
-		cb.Message.Text = action
-		handleMessage(cb.Message)
-		return
-	}
 
 	switch action {
 	case "main_menu":
-		editMessage(cb.Message.MessageId, chatIdStr, "主菜单", "", buildMainMenuKeyboard())
-	case "create_tenant":
+		sendMainMenuKeyboard(chatIdStr, messageId)
+	case "select_tenant":
+		sendTenantSelectionKeyboard(chatIdStr, "tenant_selected", messageId)
+	case "tenant_selected":
 		tenantName := parts[1]
-		sendInstanceSelectionKeyboard(chatIdStr, tenantName, cb.Message.MessageId)
+		mu.Lock()
+		selectedTenants[chatId] = tenantName
+		mu.Unlock()
+		sendTenantMenuKeyboard(chatIdStr, tenantName, messageId)
+	case "tenant_menu":
+		mu.RLock()
+		tenantName, ok := selectedTenants[chatId]
+		mu.RUnlock()
+		if !ok {
+			editMessage(messageId, chatIdStr, "错误: 未选择租户。请先返回主菜单选择。", "", buildMainMenuKeyboard())
+			return
+		}
+		sendTenantMenuKeyboard(chatIdStr, tenantName, messageId)
+	case "create_instance_menu":
+		sendInstanceSelectionKeyboard(chatIdStr, messageId)
+	case "list_instances_menu":
+		sendInstanceList(chatIdStr, messageId)
 	case "create_instance":
-		tenantName := parts[1]
-		instanceTemplate := parts[2]
+		mu.RLock()
+		tenantName, ok := selectedTenants[chatId]
+		mu.RUnlock()
+		if !ok {
+			editMessage(messageId, chatIdStr, "错误: 会话已过期，请重新选择租户。", "", buildMainMenuKeyboard())
+			return
+		}
+		instanceTemplate := parts[1]
 		go startCreationTask(chatIdStr, tenantName, instanceTemplate)
-		text := fmt.Sprintf("✅ 任务已创建!\n租户: %s\n模版: %s\n\n使用 /list_tasks 查看进度或停止任务。", tenantName, instanceTemplate)
-		editMessage(cb.Message.MessageId, chatIdStr, text, "", buildMainMenuKeyboard())
+		text := fmt.Sprintf("✅ 任务已创建!\n租户: *%s*\n模版: *%s*\n\n使用 /list_tasks 查看进度或停止任务。", tenantName, instanceTemplate)
+		editMessage(messageId, chatIdStr, text, "", buildMainMenuKeyboard())
 	case "list_tasks":
-		sendTaskListKeyboard(chatIdStr, cb.Message.MessageId)
+		sendTaskListKeyboard(chatIdStr, messageId)
 	case "stop_task":
 		taskID := parts[1]
 		task, ok := taskManager.Get(taskID)
@@ -511,28 +519,69 @@ func handleCallbackQuery(cb *CallbackQuery) {
 			task.cancelFunc()
 			task.UpdateStatus("正在停止...")
 		}
-		// Refresh the task list to show the updated status
-		sendTaskListKeyboard(chatIdStr, cb.Message.MessageId)
-	case "list_instances_tenant":
-		tenantName := parts[1]
-		go sendInstanceList(chatIdStr, tenantName, cb.Message.MessageId)
+		sendTaskListKeyboard(chatIdStr, messageId)
+	case "check_tenants":
+		go func() {
+			editMessage(messageId, chatIdStr, "正在检查所有租户凭证状态，请稍候...", "", nil)
+			app := &App{}
+			app.loadOracleSections(cfg)
+			resultText := app.checkAllTenantsActivity(true)
+			editMessage(messageId, chatIdStr, "所有租户凭证检查完成:", resultText, buildMainMenuKeyboard())
+		}()
+	case "instance_details":
+		instanceId := parts[1]
+		sendInstanceDetailsKeyboard(chatIdStr, messageId, instanceId)
+	case "instance_action":
+		actionType := parts[1]
+		instanceId := parts[2]
+		handleInstanceAction(chatIdStr, messageId, instanceId, actionType)
+	case "change_ip":
+		instanceId := parts[1]
+		handleChangeIp(chatIdStr, messageId, instanceId)
+	case "resize_disk_prompt":
+		instanceId := parts[1]
+		mu.Lock()
+		userNextAction[chatId] = "enter_disk_size:" + instanceId
+		mu.Unlock()
+		editMessage(messageId, chatIdStr, "请输入新的引导卷大小 (GB)，例如: 100", "", nil)
+	case "change_shape_prompt":
+		instanceId := parts[1]
+		mu.Lock()
+		userNextAction[chatId] = "enter_shape_ocpu:" + instanceId
+		mu.Unlock()
+		editMessage(messageId, chatIdStr, "请输入新的OCPU数量 (例如: 4)", "", nil)
 	}
 }
 
-func sendMainMenuKeyboard(chatId string) {
+func sendMainMenuKeyboard(chatId string, messageId int) {
 	text := "欢迎使用OCI助手机器人! 请选择一个操作:"
-	sendMessage(chatId, "", text, buildMainMenuKeyboard())
+	if messageId > 0 {
+		editMessage(messageId, chatId, text, "", buildMainMenuKeyboard())
+	} else {
+		sendMessage(chatId, "", text, buildMainMenuKeyboard())
+	}
 }
 
 func buildMainMenuKeyboard() *InlineKeyboardMarkup {
 	return &InlineKeyboardMarkup{
 		InlineKeyboard: [][]InlineKeyboardButton{
-			{{Text: "⚙️ 创建实例", CallbackData: "/create"}},
-			{{Text: "📊 查看抢机任务", CallbackData: "/list_tasks"}},
-			{{Text: "🖥️ 查看实例列表", CallbackData: "/list_instances"}},
-			{{Text: "🔑 检查所有租户", CallbackData: "/check_tenants"}},
+			{{Text: "👤 选择租户", CallbackData: "select_tenant"}},
+			{{Text: "📊 查看抢机任务", CallbackData: "list_tasks"}},
+			{{Text: "🔑 检查所有租户", CallbackData: "check_tenants"}},
 		},
 	}
+}
+
+func sendTenantMenuKeyboard(chatId, tenantName string, messageId int) {
+	text := fmt.Sprintf("当前租户: *%s*\n请选择一个操作:", tenantName)
+	keyboard := &InlineKeyboardMarkup{
+		InlineKeyboard: [][]InlineKeyboardButton{
+			{{Text: "⚙️ 创建实例", CallbackData: "create_instance_menu"}},
+			{{Text: "🖥️ 查看实例列表", CallbackData: "list_instances_menu"}},
+			{{Text: "« 返回主菜单", CallbackData: "main_menu"}},
+		},
+	}
+	editMessage(messageId, chatId, text, "", keyboard)
 }
 
 func sendTenantSelectionKeyboard(chatId, callbackPrefix string, messageId int) {
@@ -550,7 +599,17 @@ func sendTenantSelectionKeyboard(chatId, callbackPrefix string, messageId int) {
 	editMessage(messageId, chatId, "请选择一个租户:", "", &keyboard)
 }
 
-func sendInstanceSelectionKeyboard(chatId, tenantName string, messageId int) {
+func sendInstanceSelectionKeyboard(chatId string, messageId int) {
+	chatIdInt, _ := strconv.ParseInt(chatId, 10, 64)
+	mu.RLock()
+	tenantName, ok := selectedTenants[chatIdInt]
+	mu.RUnlock()
+
+	if !ok {
+		editMessage(messageId, chatId, "错误: 未选择租户。请先返回主菜单选择。", "", buildMainMenuKeyboard())
+		return
+	}
+
 	app := &App{}
 	app.loadOracleSections(cfg)
 	var targetSection *ini.Section
@@ -561,9 +620,10 @@ func sendInstanceSelectionKeyboard(chatId, tenantName string, messageId int) {
 		}
 	}
 	if targetSection == nil {
-		editMessage(messageId, chatId, "错误: 未找到租户。", "", nil)
+		editMessage(messageId, chatId, "错误: 未找到租户配置。", "", buildMainMenuKeyboard())
 		return
 	}
+
 	var instanceSections []*ini.Section
 	instanceSections = append(instanceSections, app.instanceBaseSection.ChildSections()...)
 	instanceSections = append(instanceSections, targetSection.ChildSections()...)
@@ -571,42 +631,65 @@ func sendInstanceSelectionKeyboard(chatId, tenantName string, messageId int) {
 		editMessage(messageId, chatId, "此租户下未找到任何实例模版。", "", buildMainMenuKeyboard())
 		return
 	}
+
 	var buttons [][]InlineKeyboardButton
 	for _, sec := range instanceSections {
 		shape := sec.Key("shape").Value()
 		row := []InlineKeyboardButton{
-			{Text: fmt.Sprintf("%s (%s)", sec.Name(), shape), CallbackData: "create_instance:" + tenantName + ":" + sec.Name()},
+			{Text: fmt.Sprintf("%s (%s)", sec.Name(), shape), CallbackData: "create_instance:" + sec.Name()},
 		}
 		buttons = append(buttons, row)
 	}
-	buttons = append(buttons, []InlineKeyboardButton{{Text: "« 返回主菜单", CallbackData: "main_menu"}})
+	buttons = append(buttons, []InlineKeyboardButton{{Text: "« 返回租户菜单", CallbackData: "tenant_menu"}})
 	keyboard := InlineKeyboardMarkup{InlineKeyboard: buttons}
-	editMessage(messageId, chatId, "请选择要创建的实例模版:", "", &keyboard)
+	editMessage(messageId, chatId, fmt.Sprintf("当前租户: *%s*\n请选择要创建的实例模版:", tenantName), "", &keyboard)
 }
 
 func sendTaskListKeyboard(chatId string, messageId int) {
 	tasks := taskManager.List()
-	if len(tasks) == 0 {
-		editMessage(messageId, chatId, "当前没有正在运行的抢机任务。", "", buildMainMenuKeyboard())
-		return
-	}
 	var sb strings.Builder
-	sb.WriteString("当前抢机任务列表:\n\n")
-	var buttons [][]InlineKeyboardButton
-	for _, task := range tasks {
-		sb.WriteString(task.GetStatus() + "\n\n")
-		buttons = append(buttons, []InlineKeyboardButton{
-			{Text: "❌ 停止任务 " + task.ID[:8], CallbackData: "stop_task:" + task.ID},
-		})
+	var keyboard InlineKeyboardMarkup
+
+	if len(tasks) == 0 {
+		sb.WriteString("当前没有正在运行的抢机任务。")
+		keyboard = InlineKeyboardMarkup{
+			InlineKeyboard: [][]InlineKeyboardButton{
+				{{Text: "« 返回主菜单", CallbackData: "main_menu"}},
+			},
+		}
+	} else {
+		sb.WriteString("当前抢机任务列表:\n\n")
+		var buttons [][]InlineKeyboardButton
+		for _, task := range tasks {
+			sb.WriteString(task.GetStatus() + "\n\n")
+			buttons = append(buttons, []InlineKeyboardButton{
+				{Text: "❌ 停止任务 " + task.ID[:8], CallbackData: "stop_task:" + task.ID},
+			})
+		}
+		buttons = append(buttons, []InlineKeyboardButton{{Text: "🔄 刷新", CallbackData: "list_tasks"}})
+		buttons = append(buttons, []InlineKeyboardButton{{Text: "« 返回主菜单", CallbackData: "main_menu"}})
+		keyboard.InlineKeyboard = buttons
 	}
-	buttons = append(buttons, []InlineKeyboardButton{{Text: "🔄 刷新", CallbackData: "list_tasks"}})
-	buttons = append(buttons, []InlineKeyboardButton{{Text: "« 返回主菜单", CallbackData: "main_menu"}})
-	keyboard := InlineKeyboardMarkup{InlineKeyboard: buttons}
-	editMessage(messageId, chatId, sb.String(), "", &keyboard)
+
+	if messageId > 0 {
+		editMessage(messageId, chatId, sb.String(), "", &keyboard)
+	} else {
+		sendMessage(chatId, "", sb.String(), &keyboard)
+	}
 }
 
-func sendInstanceList(chatId, tenantName string, messageId int) {
-	editMessage(messageId, chatId, fmt.Sprintf("正在为租户 [%s] 获取实例列表...", tenantName), "", nil)
+func sendInstanceList(chatId string, messageId int) {
+	chatIdInt, _ := strconv.ParseInt(chatId, 10, 64)
+	mu.RLock()
+	tenantName, ok := selectedTenants[chatIdInt]
+	mu.RUnlock()
+
+	if !ok {
+		editMessage(messageId, chatId, "错误: 未选择租户。请先返回主菜单选择。", "", buildMainMenuKeyboard())
+		return
+	}
+
+	editMessage(messageId, chatId, fmt.Sprintf("正在为租户 *%s* 获取实例列表...", tenantName), "", nil)
 	app := &App{}
 	app.loadOracleSections(cfg)
 	var targetSection *ini.Section
@@ -642,18 +725,24 @@ func sendInstanceList(chatId, tenantName string, messageId int) {
 		editMessage(messageId, chatId, "错误: 获取实例列表失败: "+err.Error(), "", nil)
 		return
 	}
-	if len(allInstances) == 0 {
-		editMessage(messageId, chatId, fmt.Sprintf("租户 [%s] 下没有实例。", tenantName), "", buildMainMenuKeyboard())
-		return
-	}
+
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("租户 [%s] 的实例列表:\n", tenantName))
-	sb.WriteString("```\n")
-	for _, inst := range allInstances {
-		sb.WriteString(fmt.Sprintf("- %s (%s): %s\n", *inst.DisplayName, *inst.Shape, getInstanceState(inst.LifecycleState)))
+	sb.WriteString(fmt.Sprintf("租户 *%s* 的实例列表:\n", tenantName))
+	var buttons [][]InlineKeyboardButton
+
+	if len(allInstances) == 0 {
+		sb.WriteString("没有找到任何实例。")
+	} else {
+		for _, inst := range allInstances {
+			sb.WriteString(fmt.Sprintf("\n- *%s* (%s): %s\n", *inst.DisplayName, *inst.Shape, getInstanceState(inst.LifecycleState)))
+			buttons = append(buttons, []InlineKeyboardButton{{Text: fmt.Sprintf("管理 %s", *inst.DisplayName), CallbackData: "instance_details:" + *inst.Id}})
+		}
 	}
-	sb.WriteString("```")
-	editMessage(messageId, chatId, sb.String(), "", buildMainMenuKeyboard())
+	
+	buttons = append(buttons, []InlineKeyboardButton{{Text: "« 返回租户菜单", CallbackData: "tenant_menu"}})
+	keyboard := &InlineKeyboardMarkup{InlineKeyboard: buttons}
+
+	editMessage(messageId, chatId, sb.String(), "", keyboard)
 }
 
 func startCreationTask(chatId, tenantName, instanceTemplate string) {
@@ -735,7 +824,7 @@ func (app *App) LaunchInstances(ctx context.Context, task *CreationTask, ads []i
 	each := instance.Each
 	sum := instance.Sum
 	if sum == 0 {
-		sum = 1 // Default to creating 1 instance if sum is not set
+		sum = 1 // 默认创建1个实例
 	}
 	task.TotalCount = sum
 
@@ -900,7 +989,7 @@ func (app *App) LaunchInstances(ctx context.Context, task *CreationTask, ads []i
 			task.UpdateStatus("用户已手动停止")
 			return
 		case <-time.After(time.Duration(sleepRandomSecond(minTime, maxTime)) * time.Second):
-			// Continue loop
+			// 继续循环
 		}
 	}
 }
@@ -1015,7 +1104,7 @@ func (app *App) showMainMenu() {
 		var input string
 		fmt.Scanln(&input)
 		if strings.EqualFold(input, "q") || input == "" {
-			return // Returns to account selection
+			return // 返回到账号选择
 		}
 
 		if strings.EqualFold(input, "oci") {
@@ -1639,11 +1728,11 @@ func (app *App) listLaunchInstanceTemplates() {
 			continue
 		}
 
-		// This call needs to be adapted for CLI mode if tasks are used
-		// For now, it will not have cancellation in CLI mode.
+		// 此调用需要适应CLI模式（如果使用任务）
+		// 目前，在CLI模式下它不会被取消。
 		taskCtx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		task := &CreationTask{ID: "cli_task"} // Dummy task for CLI
+		task := &CreationTask{ID: "cli_task"} // CLI的虚拟任务
 		app.LaunchInstances(taskCtx, task, app.availabilityDomains, instance)
 	}
 
@@ -1684,7 +1773,7 @@ func (app *App) batchLaunchInstances(oracleSec *ini.Section) {
 		}
 		taskCtx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		task := &CreationTask{ID: "cli_batch_task"} // Dummy task
+		task := &CreationTask{ID: "cli_batch_task"} // 虚拟任务
 		app.LaunchInstances(taskCtx, task, app.availabilityDomains, instance)
 		SUM += task.TotalCount
 		NUM += task.SuccessCount
@@ -1735,12 +1824,12 @@ func (app *App) ListInstancesIPs(filePath string, sectionName string) {
 	}
 
 	if err != nil {
-		fmt.Printf("ListVnicAttachments Error: %s\n", err.Error())
+		fmt.Printf("ListVnicAttachments 错误: %s\n", err.Error())
 		return
 	}
 	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_WRONLY, os.ModeAppend)
 	if err != nil {
-		fmt.Printf("打开文件失败, Error: %s\n", err.Error())
+		fmt.Printf("打开文件失败, 错误: %s\n", err.Error())
 		return
 	}
 	_, err = io.WriteString(file, "["+sectionName+"]\n")
@@ -1757,7 +1846,7 @@ func (app *App) ListInstancesIPs(filePath string, sectionName string) {
 			fmt.Printf("[%s] 实例: %s, IP: %s\n", sectionName, *vnic.DisplayName, *vnic.PublicIp)
 			_, err = io.WriteString(file, "实例: "+*vnic.DisplayName+", IP: "+*vnic.PublicIp+"\n")
 			if err != nil {
-				fmt.Printf("写入文件失败, Error: %s\n", err.Error())
+				fmt.Printf("写入文件失败, 错误: %s\n", err.Error())
 			}
 		}
 	}
@@ -1774,7 +1863,7 @@ func sleepRandomSecond(min, max int32) int32 {
 		return max
 	}
 	second := rand.Int31n(max-min) + min
-	printf("Sleep %d Second...\n", second)
+	printf("休眠 %d 秒...\n", second)
 	return second
 }
 func getProvider(oracle Oracle) (common.ConfigurationProvider, error) {
@@ -1813,14 +1902,14 @@ func CreateOrGetNetworkInfrastructure(ctx context.Context, c core.VirtualNetwork
 func createOrGetSubnetWithDetails(ctx context.Context, c core.VirtualNetworkClient, vcnID *string,
 	displayName *string, cidrBlock *string, dnsLabel *string, availableDomain *string, tenancyId *string) (subnet core.Subnet, err error) {
 
-	// 1. List existing subnets in the VCN
+	// 1. 列出VCN中已有的子网
 	var subnets []core.Subnet
 	subnets, err = listSubnets(ctx, c, vcnID, tenancyId)
 	if err != nil {
-		return subnet, fmt.Errorf("failed to list subnets: %w", err)
+		return subnet, fmt.Errorf("列出子网失败: %w", err)
 	}
 
-	// 2. If a specific display name is provided in the config, try to find it.
+	// 2. 如果在配置中提供了特定的显示名称，则尝试查找它。
 	if displayName != nil && *displayName != "" {
 		for _, s := range subnets {
 			if s.DisplayName != nil && *s.DisplayName == *displayName {
@@ -1828,19 +1917,19 @@ func createOrGetSubnetWithDetails(ctx context.Context, c core.VirtualNetworkClie
 				return s, nil
 			}
 		}
-		// If not found by name, it will fall through to the creation logic.
+		// 如果按名称找不到，将继续执行创建逻辑。
 	} else {
-		// 3. If no name is provided, and subnets exist, reuse the first one found.
+		// 3. 如果未提供名称，并且存在子网，则复用找到的第一个子网。
 		if len(subnets) > 0 {
 			fmt.Printf("未指定子网名称，找到并复用第一个可用的子网: %s\n", *subnets[0].DisplayName)
 			return subnets[0], nil
 		}
 	}
 
-	// 4. If no suitable subnet is found, proceed to create a new one.
+	// 4. 如果找不到合适的子网，则继续创建一个新的。
 	fmt.Printf("开始创建Subnet（没有可用的Subnet，或指定的Subnet不存在）\n")
 
-	// Generate a name for the new subnet if one wasn't provided.
+	// 如果未提供名称，则为新子网生成一个名称。
 	var creationDisplayName *string
 	if displayName != nil && *displayName != "" {
 		creationDisplayName = displayName
@@ -1848,13 +1937,13 @@ func createOrGetSubnetWithDetails(ctx context.Context, c core.VirtualNetworkClie
 		creationDisplayName = common.String("subnet-" + time.Now().Format("20060102-1504"))
 	}
 
-	// 5. Attempt to create the subnet, handling CIDR conflicts by trying subsequent blocks.
+	// 5. 尝试创建子网，通过尝试后续的块来处理CIDR冲突。
 	baseCidr := "10.0.0.0/20"
 	if cidrBlock != nil && *cidrBlock != "" {
 		baseCidr = *cidrBlock
 	}
 
-	for i := 0; i < 16; i++ { // Try up to 16 times for a /16 VCN range
+	for i := 0; i < 16; i++ { // 对于 /16 VCN范围，最多尝试16次
 		request := core.CreateSubnetRequest{
 			CreateSubnetDetails: core.CreateSubnetDetails{
 				CompartmentId: tenancyId,
@@ -1870,7 +1959,7 @@ func createOrGetSubnetWithDetails(ctx context.Context, c core.VirtualNetworkClie
 		r, err = c.CreateSubnet(ctx, request)
 
 		if err == nil {
-			// Success, now poll until the subnet is 'Available'
+			// 成功，现在轮询直到子网状态变为'Available'
 			pollUntilAvailable := func(r common.OCIOperationResponse) bool {
 				if converted, ok := r.Response.(core.GetSubnetResponse); ok {
 					return converted.LifecycleState != core.SubnetLifecycleStateAvailable
@@ -1885,10 +1974,10 @@ func createOrGetSubnetWithDetails(ctx context.Context, c core.VirtualNetworkClie
 
 			_, err = c.GetSubnet(ctx, pollGetRequest)
 			if err != nil {
-				return subnet, err // return error from polling
+				return subnet, err // 返回轮询错误
 			}
 
-			// Update the security list to allow all ingress traffic
+			// 更新安全列表以允许所有入站流量
 			getReq := core.GetSecurityListRequest{
 				SecurityListId:  common.String(r.SecurityListIds[0]),
 				RequestMetadata: getCustomRequestMetadataWithRetryPolicy(),
@@ -1897,11 +1986,11 @@ func createOrGetSubnetWithDetails(ctx context.Context, c core.VirtualNetworkClie
 			var getResp core.GetSecurityListResponse
 			getResp, err = c.GetSecurityList(ctx, getReq)
 			if err != nil {
-				return subnet, err // return error from getting security list
+				return subnet, err // 返回获取安全列表的错误
 			}
 
 			newRules := append(getResp.IngressSecurityRules, core.IngressSecurityRule{
-				Protocol: common.String("all"), // Allow all protocols
+				Protocol: common.String("all"), // 允许所有协议
 				Source:   common.String("0.0.0.0/0"),
 			})
 
@@ -1915,51 +2004,51 @@ func createOrGetSubnetWithDetails(ctx context.Context, c core.VirtualNetworkClie
 
 			_, err = c.UpdateSecurityList(ctx, updateReq)
 			if err != nil {
-				return subnet, err // return error from updating security list
+				return subnet, err // 返回更新安全列表的错误
 			}
 			fmt.Printf("Subnet创建成功: %s\n", *r.Subnet.DisplayName)
 			subnet = r.Subnet
-			return subnet, nil // Return the successfully created subnet
+			return subnet, nil // 返回成功创建的子网
 		}
 
-		// Check if the error is a CIDR overlap conflict
+		// 检查错误是否为CIDR重叠冲突
 		if serviceError, ok := common.IsServiceError(err); ok {
 			if serviceError.GetHTTPStatusCode() == 400 && strings.Contains(serviceError.GetMessage(), "overlaps with this CIDR") {
-				printf("CIDR %s overlaps. Trying next CIDR...\n", baseCidr)
+				printf("CIDR %s 重叠。正在尝试下一个 CIDR...\n", baseCidr)
 
-				// Calculate the next CIDR block. For a /20, the third octet increments by 16.
+				// 计算下一个CIDR块。对于 /20，第三个八位字节增加16。
 				var ip net.IP
 				var ipnet *net.IPNet
 				ip, ipnet, err = net.ParseCIDR(baseCidr)
 				if err != nil {
-					return subnet, fmt.Errorf("failed to parse CIDR for retry logic: %w", err)
+					return subnet, fmt.Errorf("为重试逻辑解析CIDR失败: %w", err)
 				}
 				ip = ip.To4()
 				if ip == nil {
-					return subnet, errors.New("failed to parse CIDR to IPv4 for retry logic")
+					return subnet, errors.New("为重试逻辑解析CIDR到IPv4失败")
 				}
 
-				// Increment the third octet.
+				// 递增第三个八位字节。
 				ip[2] += 16
 
-				// Check for overflow on the third octet (e.g., 10.0.240.0 -> 10.1.0.0)
-				if ip[2] < 16 { // it wrapped around
-					return subnet, errors.New("ran out of available CIDR blocks in 10.0.0.0/16 range")
+				// 检查第三个八位字节是否溢出 (例如, 10.0.240.0 -> 10.1.0.0)
+				if ip[2] < 16 { // 它环绕了
+					return subnet, errors.New("在 10.0.0.0/16 范围内已无可用CIDR块")
 				}
 
-				// Reconstruct CIDR string with the same mask size
+				// 使用相同的掩码大小重构CIDR字符串
 				_, mask := ipnet.Mask.Size()
 				baseCidr = fmt.Sprintf("%s/%d", ip.String(), mask)
-				continue // Retry with the new CIDR
+				continue // 使用新的CIDR重试
 			}
 		}
 
-		// If it's a different, non-recoverable error, fail immediately
+		// 如果是其他不可恢复的错误，则立即失败
 		return subnet, err
 	}
 
-	// If the loop finishes without successfully creating a subnet
-	return subnet, fmt.Errorf("failed to create a subnet after multiple attempts: %w", err)
+	// 如果循环完成而没有成功创建子网
+	return subnet, fmt.Errorf("多次尝试后创建子网失败: %w", err)
 }
 func listSubnets(ctx context.Context, c core.VirtualNetworkClient, vcnID, tenancyId *string) (subnets []core.Subnet, err error) {
 	request := core.ListSubnetsRequest{
@@ -1988,12 +2077,12 @@ func createOrGetVcn(ctx context.Context, c core.VirtualNetworkClient, tenancyId 
 	}
 	for _, element := range vcnItems {
 		if *element.DisplayName == instance.VcnDisplayName {
-			// VCN already created, return it
+			// VCN已存在，返回它
 			vcn = element
 			return vcn, err
 		}
 	}
-	// create a new VCN
+	// 创建一个新的VCN
 	fmt.Println("开始创建VCN（没有可用的VCN，或指定的VCN不存在）")
 	if *displayName == "" {
 		displayName = common.String(time.Now().Format("vcn-20060102-1504"))
@@ -2024,7 +2113,7 @@ func listVcns(ctx context.Context, c core.VirtualNetworkClient, tenancyId *strin
 	return r.Items, err
 }
 func createOrGetInternetGateway(c core.VirtualNetworkClient, vcnID, tenancyId *string) (core.InternetGateway, error) {
-	//List Gateways
+	//列出网关
 	var gateway core.InternetGateway
 	listGWRequest := core.ListInternetGatewaysRequest{
 		CompartmentId:   tenancyId,
@@ -2034,15 +2123,15 @@ func createOrGetInternetGateway(c core.VirtualNetworkClient, vcnID, tenancyId *s
 
 	listGWRespone, err := c.ListInternetGateways(ctx, listGWRequest)
 	if err != nil {
-		fmt.Printf("Internet gateway list error: %s\n", err.Error())
+		fmt.Printf("Internet网关列表错误: %s\n", err.Error())
 		return gateway, err
 	}
 
 	if len(listGWRespone.Items) >= 1 {
-		//Gateway with name already exists
+		// 网关已存在
 		gateway = listGWRespone.Items[0]
 	} else {
-		//Create new Gateway
+		// 创建新网关
 		fmt.Printf("开始创建Internet网关\n")
 		enabled := true
 		createGWDetails := core.CreateInternetGatewayDetails{
@@ -2058,7 +2147,7 @@ func createOrGetInternetGateway(c core.VirtualNetworkClient, vcnID, tenancyId *s
 		createGWResponse, err := c.CreateInternetGateway(ctx, createGWRequest)
 
 		if err != nil {
-			fmt.Printf("Internet gateway create error: %s\n", err.Error())
+			fmt.Printf("Internet网关创建错误: %s\n", err.Error())
 			return gateway, err
 		}
 		gateway = createGWResponse.InternetGateway
@@ -2067,7 +2156,7 @@ func createOrGetInternetGateway(c core.VirtualNetworkClient, vcnID, tenancyId *s
 	return gateway, err
 }
 func createOrGetRouteTable(c core.VirtualNetworkClient, gatewayID, VcnID, tenancyId *string) (routeTable core.RouteTable, err error) {
-	//List Route Table
+	//列出路由表
 	listRTRequest := core.ListRouteTablesRequest{
 		CompartmentId:   tenancyId,
 		VcnId:           VcnID,
@@ -2076,7 +2165,7 @@ func createOrGetRouteTable(c core.VirtualNetworkClient, gatewayID, VcnID, tenanc
 	var listRTResponse core.ListRouteTablesResponse
 	listRTResponse, err = c.ListRouteTables(ctx, listRTRequest)
 	if err != nil {
-		fmt.Printf("Route table list error: %s\n", err.Error())
+		fmt.Printf("路由表列表错误: %s\n", err.Error())
 		return
 	}
 
@@ -2088,10 +2177,10 @@ func createOrGetRouteTable(c core.VirtualNetworkClient, gatewayID, VcnID, tenanc
 	}
 
 	if len(listRTResponse.Items) >= 1 {
-		//Default Route Table found and has at least 1 route rule
+		// 找到默认路由表并且至少有1条路由规则
 		if len(listRTResponse.Items[0].RouteRules) >= 1 {
 			routeTable = listRTResponse.Items[0]
-			//Default Route table needs route rule adding
+			// 默认路由表需要添加路由规则
 		} else {
 			fmt.Printf("路由表未添加规则，开始添加Internet路由规则\n")
 			updateRTDetails := core.UpdateRouteTableDetails{
@@ -2106,7 +2195,7 @@ func createOrGetRouteTable(c core.VirtualNetworkClient, gatewayID, VcnID, tenanc
 			var updateRTResponse core.UpdateRouteTableResponse
 			updateRTResponse, err = c.UpdateRouteTable(ctx, updateRTRequest)
 			if err != nil {
-				fmt.Printf("Error updating route table: %s\n", err)
+				fmt.Printf("更新路由表时出错: %s\n", err)
 				return
 			}
 			fmt.Printf("Internet路由规则添加成功\n")
@@ -2114,8 +2203,8 @@ func createOrGetRouteTable(c core.VirtualNetworkClient, gatewayID, VcnID, tenanc
 		}
 
 	} else {
-		//No default route table found
-		fmt.Printf("Error could not find VCN default route table, VCN OCID: %s Could not find route table.\n", *VcnID)
+		// 未找到默认路由表
+		fmt.Printf("错误，找不到VCN默认路由表, VCN OCID: %s\n", *VcnID)
 	}
 	return
 }
@@ -2332,7 +2421,7 @@ func getInstanceVnics(clients *OciClients, instanceId *string) (vnics []core.Vni
 	for _, vnicAttachment := range vnicAttachments {
 		vnic, vnicErr := GetVnic(clients.Network, vnicAttachment.VnicId)
 		if vnicErr != nil {
-			fmt.Printf("GetVnic error: %s\n", vnicErr.Error())
+			fmt.Printf("GetVnic 错误: %s\n", vnicErr.Error())
 			continue
 		}
 		vnics = append(vnics, vnic)
@@ -2406,7 +2495,7 @@ func getInstancePublicIps(clients *OciClients, instanceId *string) (ips []string
 			for _, vnicAttachment := range vnicAttachments {
 				vnic, vnicErr := GetVnic(clients.Network, vnicAttachment.VnicId)
 				if vnicErr != nil {
-					printf("GetVnic error: %s\n", vnicErr.Error())
+					printf("GetVnic 错误: %s\n", vnicErr.Error())
 					continue
 				}
 				if vnic.PublicIp != nil && *vnic.PublicIp != "" {
@@ -2582,7 +2671,7 @@ func setProxyOrNot(client *common.BaseClient) {
 	if appConfig.proxy != "" {
 		proxyURL, err := url.Parse(appConfig.proxy)
 		if err != nil {
-			printlnErr("URL parse failed", err.Error())
+			printlnErr("URL解析失败", err.Error())
 			return
 		}
 		client.HTTPClient = &http.Client{
@@ -2666,7 +2755,7 @@ func printf(format string, a ...interface{}) {
 	fmt.Printf(format, a...)
 }
 func printlnErr(desc, detail string) {
-	fmt.Printf("\033[1;31mError: %s. %s\033[0m\n", desc, detail)
+	fmt.Printf("\033[1;31m错误: %s. %s\033[0m\n", desc, detail)
 }
 func getCustomRequestMetadataWithRetryPolicy() common.RequestMetadata {
 	return common.RequestMetadata{
@@ -2674,9 +2763,9 @@ func getCustomRequestMetadataWithRetryPolicy() common.RequestMetadata {
 	}
 }
 func getCustomRetryPolicy() *common.RetryPolicy {
-	// how many times to do the retry
+	// 重试次数
 	attempts := uint(3)
-	// retry for all non-200 status code
+	// 对所有非200状态码进行重试
 	retryOnAllNon200ResponseCodes := func(r common.OCIOperationResponse) bool {
 		return !(r.Error == nil && 199 < r.Response.HTTPResponse().StatusCode && r.Response.HTTPResponse().StatusCode < 300)
 	}
@@ -2808,10 +2897,10 @@ func (app *App) adminDetails(user identity.User) {
 		switch num {
 		case 1:
 			app.updateAdmin(user)
-			return // Return to refresh details
+			return // 返回以刷新详情
 		case 2:
 			app.deleteAdmin(user)
-			return // Return to admin list
+			return // 返回到管理员列表
 		default:
 			fmt.Println("\033[1;31m输入无效\033[0m")
 		}
@@ -2823,7 +2912,7 @@ func (app *App) createAdmin() {
 	fmt.Scanln(&name)
 	fmt.Print("请输入新管理员描述: ")
 	fmt.Scanln(&description)
-	email = name // In OCI, user name is the email
+	email = name // 在OCI中，用户名就是邮箱
 
 	req := identity.CreateUserRequest{
 		CreateUserDetails: identity.CreateUserDetails{
@@ -2843,7 +2932,7 @@ func (app *App) createAdmin() {
 	fmt.Printf("\033[1;32m用户 '%s' 创建成功！\033[0m\n", *userResp.User.Name)
 
 	fmt.Println("正在将用户添加到 'Administrators' 组...")
-	// Find Administrators group
+	// 查找Administrators组
 	listGroupsResp, err := app.clients.Identity.ListGroups(ctx, identity.ListGroupsRequest{CompartmentId: &app.oracleConfig.Tenancy, Name: common.String("Administrators")})
 	if err != nil || len(listGroupsResp.Items) == 0 {
 		printlnErr("找不到 'Administrators' 组", "")
@@ -2978,7 +3067,7 @@ func (app *App) listAllSubnets() {
 		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\n", i+1, *subnet.DisplayName, *subnet.CidrBlock, ipv6Cidr, subnet.LifecycleState, subnetType)
 	}
 	w.Flush()
-	// TODO: Add modification logic if needed
+	// TODO: 如果需要，添加修改逻辑
 }
 func (app *App) listAllSecurityLists() {
 	fmt.Println("正在获取安全列表...")
@@ -3039,7 +3128,7 @@ func (app *App) securityListDetails(sl core.SecurityList) {
 		fmt.Fprintf(ew, "%s\t%s\t%t\t%s\n", *rule.Destination, *rule.Protocol, *rule.IsStateless, rule.Description)
 	}
 	ew.Flush()
-	// TODO: Add rule modification logic
+	// TODO: 添加规则修改逻辑
 }
 func getSubnet(c core.VirtualNetworkClient, subnetId *string) (core.Subnet, error) {
 	req := core.GetSubnetRequest{SubnetId: subnetId}
@@ -3109,13 +3198,13 @@ func (app *App) viewInstanceTraffic(instanceId *string) {
 func (app *App) queryTraffic(instanceId *string, startTime, endTime time.Time, resolution string) {
 	fmt.Println("正在查询流量数据，请稍候...")
 	namespace := "oci_computeagent"
-	// Metrics: NetworksBytesIn, NetworksBytesOut
+	// 指标: NetworksBytesIn, NetworksBytesOut
 	queryIn := fmt.Sprintf("NetworksBytesIn[1m]{resourceId = \"%s\"}.sum()", *instanceId)
 	queryOut := fmt.Sprintf("NetworksBytesOut[1m]{resourceId = \"%s\"}.sum()", *instanceId)
 
 	var totalIn, totalOut float64
 
-	// Get Inbound Traffic
+	// 获取入站流量
 	inResp, err := getMetrics(app.clients.Monitoring, &app.oracleConfig.Tenancy, namespace, queryIn, startTime, endTime, resolution)
 	if err != nil {
 		printlnErr("获取入站流量失败", err.Error())
@@ -3125,7 +3214,7 @@ func (app *App) queryTraffic(instanceId *string, startTime, endTime time.Time, r
 		}
 	}
 
-	// Get Outbound Traffic
+	// 获取出站流量
 	outResp, err := getMetrics(app.clients.Monitoring, &app.oracleConfig.Tenancy, namespace, queryOut, startTime, endTime, resolution)
 	if err != nil {
 		printlnErr("获取出站流量失败", err.Error())
@@ -3339,6 +3428,9 @@ func (app *App) checkCurrentTenantActivity() {
 	fmt.Println("\n按回车键返回...")
 	fmt.Scanln()
 }
+
+// checkAllTenantsActivity 检查所有已配置的租户并提供摘要。
+// 对于botMode，它返回一个格式化的字符串。对于CLI，它会打印到控制台。
 func (app *App) checkAllTenantsActivity(botMode bool) string {
 	if !botMode {
 		fmt.Println("正在一键检查所有租户的凭证...")
@@ -3393,41 +3485,51 @@ func (app *App) checkAllTenantsActivity(botMode bool) string {
 	wg.Wait()
 	close(resultsChan)
 
+	// 收集和处理结果
 	var results []TenantStatus
 	for res := range resultsChan {
 		results = append(results, res)
 	}
 
-	// Format output
+	totalCount := len(results)
+	normalCount := 0
+	var abnormalTenants []TenantStatus
+
+	for _, res := range results {
+		if res.Status == "有效" {
+			normalCount++
+		} else {
+			abnormalTenants = append(abnormalTenants, res)
+		}
+	}
+	abnormalCount := len(abnormalTenants)
+
+	// 格式化输出
 	var sb strings.Builder
+	var summary string
+
 	if botMode {
-		sb.WriteString("```\n") // Use markdown code block for better formatting in TG
+		sb.WriteString("```\n")
+		summary = fmt.Sprintf("检查总数: %d, 正常: %d, 异常: %d", totalCount, normalCount, abnormalCount)
 	} else {
 		fmt.Printf("\n\033[1;32m所有租户凭证检查结果\033[0m\n")
+		summary = fmt.Sprintf("检查总数: %d, 正常: \033[1;32m%d\033[0m, 异常: \033[1;31m%d\033[0m", totalCount, normalCount, abnormalCount)
 	}
 
-	w := new(tabwriter.Writer)
-	w.Init(&sb, 0, 8, 2, ' ', tabwriter.Debug)
-	fmt.Fprintln(w, "租户名称\t状态\t信息")
-	fmt.Fprintln(w, "--------\t----\t----")
-	for _, res := range results {
-		status := res.Status
-		if !botMode {
-			if status == "有效" {
-				status = "\033[1;32m有效\033[0m"
-			} else {
-				status = "\033[1;31m无效\033[0m"
-			}
-		} else {
-			if res.Status == "有效" {
-				status = "✅ " + status
-			} else {
-				status = "❌ " + status
-			}
+	sb.WriteString(summary)
+	sb.WriteString("\n")
+
+	if abnormalCount > 0 {
+		sb.WriteString("\n--- 异常清单 ---\n")
+		w := new(tabwriter.Writer)
+		w.Init(&sb, 0, 8, 2, ' ', 0)
+		fmt.Fprintln(w, "租户名称\t信息")
+		fmt.Fprintln(w, "--------\t----")
+		for _, res := range abnormalTenants {
+			fmt.Fprintf(w, "%s\t%s\n", res.Name, res.Message)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\n", res.Name, status, res.Message)
+		w.Flush()
 	}
-	w.Flush()
 
 	if botMode {
 		sb.WriteString("```")
