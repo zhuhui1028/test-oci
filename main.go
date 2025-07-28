@@ -79,9 +79,12 @@ var (
 		each           bool
 		lastUpdateId   int
 	}
-	ctx         = context.Background()
-	cfg         *ini.File
-	taskManager *TaskManager // 新增: 全局任务管理器
+	ctx             = context.Background()
+	cfg             *ini.File
+	taskManager     *TaskManager
+	selectedTenants = make(map[int64]string) // Stores the selected tenant for each chat ID
+	userNextAction  = make(map[int64]string) // Stores the next expected action for a user
+	mu              sync.Mutex               // To protect concurrent map access
 )
 
 // OCI configuration for a single account
@@ -891,7 +894,14 @@ func (app *App) LaunchInstances(ctx context.Context, task *CreationTask, ads []i
 				}
 			}
 		}
-		sleepRandomSecond(minTime, maxTime)
+		
+		select {
+		case <-ctx.Done():
+			task.UpdateStatus("用户已手动停止")
+			return
+		case <-time.After(time.Duration(sleepRandomSecond(minTime, maxTime)) * time.Second):
+			// Continue loop
+		}
 	}
 }
 
@@ -1756,17 +1766,16 @@ func (app *App) ListInstancesIPs(filePath string, sectionName string) {
 		fmt.Printf("%s\n", err.Error())
 	}
 }
-func sleepRandomSecond(min, max int32) {
-	var second int32
+func sleepRandomSecond(min, max int32) int32 {
 	if min <= 0 || max <= 0 {
-		second = 1
-	} else if min >= max {
-		second = max
-	} else {
-		second = rand.Int31n(max-min) + min
+		return 1
 	}
+	if min >= max {
+		return max
+	}
+	second := rand.Int31n(max-min) + min
 	printf("Sleep %d Second...\n", second)
-	time.Sleep(time.Duration(second) * time.Second)
+	return second
 }
 func getProvider(oracle Oracle) (common.ConfigurationProvider, error) {
 	content, err := ioutil.ReadFile(oracle.Key_file)
