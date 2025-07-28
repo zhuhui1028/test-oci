@@ -553,6 +553,357 @@ func handleCallbackQuery(cb *CallbackQuery) {
 	}
 }
 
+// handleUserInput handles text input when the bot is expecting a specific response.
+func handleUserInput(msg *TgMessage, action string) {
+	chatId := msg.Chat.Id
+	chatIdStr := strconv.FormatInt(chatId, 10)
+	parts := strings.Split(action, ":")
+	actionType := parts[0]
+
+	// Clean up the pending action for this user
+	mu.Lock()
+	delete(userNextAction, chatId)
+	mu.Unlock()
+
+	switch actionType {
+	case "enter_disk_size":
+		instanceId := parts[1]
+		size, err := strconv.ParseInt(msg.Text, 10, 64)
+		if err != nil || size <= 0 {
+			sendMessage(chatIdStr, "", "无效的大小。请输入一个正整数。", nil)
+			return
+		}
+
+		go func() {
+			sendMessage(chatIdStr, "", fmt.Sprintf("正在将实例引导卷大小调整为 *%d GB*...", size), nil)
+			// Logic to resize disk
+			mu.RLock()
+			tenantName, ok := selectedTenants[chatId]
+			mu.RUnlock()
+			if !ok {
+				sendMessage(chatIdStr, "", "错误: 会话已过期，请重新选择租户。", buildMainMenuKeyboard())
+				return
+			}
+			app := &App{}
+			app.loadOracleSections(cfg)
+			var targetSection *ini.Section
+			for _, sec := range app.oracleSections {
+				if sec.Name() == tenantName {
+					targetSection = sec
+					break
+				}
+			}
+			if err := app.initializeClients(targetSection); err != nil {
+				sendMessage(chatIdStr, "", "错误: 初始化客户端失败: "+err.Error(), nil)
+				return
+			}
+
+			// Find boot volume
+			instance, err := getInstance(app.clients.Compute, &instanceId)
+			if err != nil {
+				sendMessage(chatIdStr, "", "错误: 获取实例信息失败: "+err.Error(), nil)
+				return
+			}
+
+			attachments, err := listBootVolumeAttachments(app.clients.Compute, instance.AvailabilityDomain, instance.CompartmentId, nil)
+			if err != nil {
+				sendMessage(chatIdStr, "", "错误: 获取引导卷附件失败: "+err.Error(), nil)
+				return
+			}
+			var bootVolumeId *string
+			for _, att := range attachments {
+				if *att.InstanceId == instanceId {
+					bootVolumeId = att.BootVolumeId
+					break
+				}
+			}
+
+			if bootVolumeId == nil {
+				sendMessage(chatIdStr, "", "错误: 未找到实例的引导卷。", nil)
+				return
+			}
+
+			_, err = updateBootVolume(app.clients.Storage, bootVolumeId, &size, nil)
+			if err != nil {
+				sendMessage(chatIdStr, "", "错误: 修改引导卷大小失败: "+err.Error(), nil)
+			} else {
+				sendMessage(chatIdStr, "", "✅ 引导卷大小修改成功！实例将重启以应用更改。", nil)
+				// Reboot instance to apply change
+				instanceAction(app.clients.Compute, &instanceId, core.InstanceActionActionSoftreset)
+			}
+		}()
+
+	case "enter_shape_ocpu":
+		instanceId := parts[1]
+		ocpu, err := strconv.ParseFloat(msg.Text, 32)
+		if err != nil || ocpu <= 0 {
+			sendMessage(chatIdStr, "", "无效的OCPU数量。请输入一个正数。", nil)
+			return
+		}
+		mu.Lock()
+		// Ask for memory, passing along instanceId and ocpu
+		userNextAction[chatId] = fmt.Sprintf("enter_shape_memory:%s:%f", instanceId, ocpu)
+		mu.Unlock()
+		sendMessage(chatIdStr, "", "请输入新的内存大小 (GB)，例如: 24", nil)
+
+	case "enter_shape_memory":
+		instanceId := parts[1]
+		ocpuStr := parts[2]
+		ocpu64, _ := strconv.ParseFloat(ocpuStr, 32)
+		ocpu := float32(ocpu64)
+
+		memory, err := strconv.ParseFloat(msg.Text, 32)
+		if err != nil || memory <= 0 {
+			sendMessage(chatIdStr, "", "无效的内存大小。请输入一个正数。", nil)
+			return
+		}
+		memory32 := float32(memory)
+
+		go func() {
+			sendMessage(chatIdStr, "", fmt.Sprintf("正在将实例规格更改为 *%g OCPU* 和 *%g GB* 内存...", ocpu, memory32), nil)
+			// Logic to change shape
+			mu.RLock()
+			tenantName, ok := selectedTenants[chatId]
+			mu.RUnlock()
+			if !ok {
+				sendMessage(chatIdStr, "", "错误: 会话已过期，请重新选择租户。", buildMainMenuKeyboard())
+				return
+			}
+			app := &App{}
+			app.loadOracleSections(cfg)
+			var targetSection *ini.Section
+			for _, sec := range app.oracleSections {
+				if sec.Name() == tenantName {
+					targetSection = sec
+					break
+				}
+			}
+			if err := app.initializeClients(targetSection); err != nil {
+				sendMessage(chatIdStr, "", "错误: 初始化客户端失败: "+err.Error(), nil)
+				return
+			}
+			_, err := updateInstance(app.clients.Compute, &instanceId, nil, &ocpu, &memory32, nil, nil)
+			if err != nil {
+				sendMessage(chatIdStr, "", "错误: 升级/降级实例失败: "+err.Error(), nil)
+			} else {
+				sendMessage(chatIdStr, "", "✅ 实例规格修改成功！", nil)
+			}
+		}()
+	}
+}
+
+// sendInstanceDetailsKeyboard displays details for a specific instance with action buttons.
+func sendInstanceDetailsKeyboard(chatId string, messageId int, instanceId string) {
+	chatIdInt, _ := strconv.ParseInt(chatId, 10, 64)
+	mu.RLock()
+	tenantName, ok := selectedTenants[chatIdInt]
+	mu.RUnlock()
+
+	if !ok {
+		editMessage(messageId, chatId, "错误: 会话已过期，请重新选择租户。", "", buildMainMenuKeyboard())
+		return
+	}
+
+	editMessage(messageId, chatId, fmt.Sprintf("正在为租户 *%s* 获取实例 *%s* 的详细信息...", tenantName, instanceId[:8]), "", nil)
+
+	app := &App{}
+	app.loadOracleSections(cfg)
+	var targetSection *ini.Section
+	for _, sec := range app.oracleSections {
+		if sec.Name() == tenantName {
+			targetSection = sec
+			break
+		}
+	}
+	if targetSection == nil {
+		editMessage(messageId, chatId, "错误: 未找到租户。", "", buildMainMenuKeyboard())
+		return
+	}
+	if err := app.initializeClients(targetSection); err != nil {
+		editMessage(messageId, chatId, "错误: 初始化客户端失败: "+err.Error(), "", nil)
+		return
+	}
+
+	instance, err := getInstance(app.clients.Compute, &instanceId)
+	if err != nil {
+		editMessage(messageId, chatId, "错误: 获取实例信息失败: "+err.Error(), "", nil)
+		return
+	}
+
+	ips, _ := getInstancePublicIps(app.clients, &instanceId)
+	ipStr := strings.Join(ips, ", ")
+	if ipStr == "" {
+		ipStr = "N/A"
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("实例: *%s*\n", *instance.DisplayName))
+	sb.WriteString(fmt.Sprintf("状态: *%s*\n", getInstanceState(instance.LifecycleState)))
+	sb.WriteString(fmt.Sprintf("IP: `%s`\n", ipStr))
+	sb.WriteString(fmt.Sprintf("配置: *%s*\n", *instance.Shape))
+	sb.WriteString(fmt.Sprintf("  - OCPU: *%g*\n", *instance.ShapeConfig.Ocpus))
+	sb.WriteString(fmt.Sprintf("  - 内存: *%g GB*\n", *instance.ShapeConfig.MemoryInGBs))
+	sb.WriteString(fmt.Sprintf("可用区: *%s*\n", *instance.AvailabilityDomain))
+	sb.WriteString(fmt.Sprintf("创建时间: *%s*", instance.TimeCreated.Format(timeLayout)))
+
+	state := instance.LifecycleState
+	var actionButtons [][]InlineKeyboardButton
+	if state == core.InstanceLifecycleStateStopped {
+		actionButtons = append(actionButtons, []InlineKeyboardButton{
+			{Text: "▶️ 启动", CallbackData: "instance_action:start:" + instanceId},
+		})
+	} else if state == core.InstanceLifecycleStateRunning {
+		actionButtons = append(actionButtons, []InlineKeyboardButton{
+			{Text: "⏹️ 停止", CallbackData: "instance_action:stop:" + instanceId},
+			{Text: "🔄 重启", CallbackData: "instance_action:reboot:" + instanceId},
+		})
+	}
+
+	actionButtons = append(actionButtons, []InlineKeyboardButton{
+		{Text: "💣 终止", CallbackData: "instance_action:terminate:" + instanceId},
+		{Text: " IP 更换", CallbackData: "change_ip:" + instanceId},
+	})
+
+	var flexButtons [][]InlineKeyboardButton
+	if strings.Contains(strings.ToLower(*instance.Shape), "flex") {
+		flexButtons = append(flexButtons, []InlineKeyboardButton{
+			{Text: "💪 修改配置", CallbackData: "change_shape_prompt:" + instanceId},
+		})
+	}
+	flexButtons = append(flexButtons, []InlineKeyboardButton{
+		{Text: "💾 修改磁盘", CallbackData: "resize_disk_prompt:" + instanceId},
+	})
+
+	var allButtonRows [][]InlineKeyboardButton
+	allButtonRows = append(allButtonRows, actionButtons...)
+	allButtonRows = append(allButtonRows, flexButtons...)
+	allButtonRows = append(allButtonRows, []InlineKeyboardButton{
+		{Text: "🔄 刷新", CallbackData: "instance_details:" + instanceId},
+	})
+	allButtonRows = append(allButtonRows, []InlineKeyboardButton{
+		{Text: "« 返回实例列表", CallbackData: "list_instances_menu"},
+	})
+
+	keyboard := &InlineKeyboardMarkup{
+		InlineKeyboard: allButtonRows,
+	}
+
+	editMessage(messageId, chatId, sb.String(), "", keyboard)
+}
+
+// handleInstanceAction performs an action (start, stop, etc.) on an instance.
+func handleInstanceAction(chatId string, messageId int, instanceId string, actionType string) {
+	chatIdInt, _ := strconv.ParseInt(chatId, 10, 64)
+	mu.RLock()
+	tenantName, ok := selectedTenants[chatIdInt]
+	mu.RUnlock()
+
+	if !ok {
+		editMessage(messageId, chatId, "错误: 会话已过期，请重新选择租户。", "", buildMainMenuKeyboard())
+		return
+	}
+
+	editMessage(messageId, chatId, fmt.Sprintf("正在对实例 *%s* 执行操作: *%s*...", instanceId[:8], actionType), "", nil)
+
+	app := &App{}
+	app.loadOracleSections(cfg)
+	var targetSection *ini.Section
+	for _, sec := range app.oracleSections {
+		if sec.Name() == tenantName {
+			targetSection = sec
+			break
+		}
+	}
+	if err := app.initializeClients(targetSection); err != nil {
+		editMessage(messageId, chatId, "错误: 初始化客户端失败: "+err.Error(), "", nil)
+		return
+	}
+
+	var err error
+	var actionEnum core.InstanceActionActionEnum
+	switch actionType {
+	case "start":
+		actionEnum = core.InstanceActionActionStart
+	case "stop":
+		actionEnum = core.InstanceActionActionSoftstop
+	case "reboot":
+		actionEnum = core.InstanceActionActionSoftreset
+	case "terminate":
+		// Special handling for terminate
+		go func() {
+			err := terminateInstance(app.clients.Compute, &instanceId)
+			if err != nil {
+				sendMessage(chatId, "", "❌ 终止实例失败: "+err.Error(), nil)
+			} else {
+				sendMessage(chatId, "", "✅ 实例已成功终止。", nil)
+				// Go back to list view after termination
+				sendInstanceList(chatId, messageId)
+			}
+		}()
+		return // Return early as terminate is async and we don't refresh the same view
+	default:
+		editMessage(messageId, chatId, "未知操作。", "", nil)
+		return
+	}
+
+	_, err = instanceAction(app.clients.Compute, &instanceId, actionEnum)
+	if err != nil {
+		editMessage(messageId, chatId, fmt.Sprintf("❌ 操作 '%s' 失败: %s", actionType, err.Error()), "", nil)
+	} else {
+		editMessage(messageId, chatId, fmt.Sprintf("✅ 操作 '%s' 请求已发送。请稍后刷新查看状态。", actionType), "", nil)
+	}
+
+	// Refresh details after a short delay
+	time.Sleep(3 * time.Second)
+	sendInstanceDetailsKeyboard(chatId, messageId, instanceId)
+}
+
+// handleChangeIp handles changing the public IP of an instance.
+func handleChangeIp(chatId string, messageId int, instanceId string) {
+	chatIdInt, _ := strconv.ParseInt(chatId, 10, 64)
+	mu.RLock()
+	tenantName, ok := selectedTenants[chatIdInt]
+	mu.RUnlock()
+
+	if !ok {
+		editMessage(messageId, chatId, "错误: 会话已过期，请重新选择租户。", "", buildMainMenuKeyboard())
+		return
+	}
+
+	editMessage(messageId, chatId, fmt.Sprintf("正在为实例 *%s* 更换IP...", instanceId[:8]), "", nil)
+
+	app := &App{}
+	app.loadOracleSections(cfg)
+	var targetSection *ini.Section
+	for _, sec := range app.oracleSections {
+		if sec.Name() == tenantName {
+			targetSection = sec
+			break
+		}
+	}
+	if err := app.initializeClients(targetSection); err != nil {
+		editMessage(messageId, chatId, "错误: 初始化客户端失败: "+err.Error(), "", nil)
+		return
+	}
+
+	vnics, err := getInstanceVnics(app.clients, &instanceId)
+	if err != nil || len(vnics) == 0 {
+		editMessage(messageId, chatId, "错误: 获取实例网络信息失败: "+err.Error(), "", nil)
+		return
+	}
+
+	publicIp, err := changePublicIp(app.clients, vnics)
+	if err != nil {
+		editMessage(messageId, chatId, "❌ 更换IP失败: "+err.Error(), "", nil)
+	} else {
+		editMessage(messageId, chatId, fmt.Sprintf("✅ 更换IP成功！新IP: `%s`", *publicIp.IpAddress), "", nil)
+	}
+
+	// Refresh details after a short delay
+	time.Sleep(3 * time.Second)
+	sendInstanceDetailsKeyboard(chatId, messageId, instanceId)
+}
+
 func sendMainMenuKeyboard(chatId string, messageId int) {
 	text := "欢迎使用OCI助手机器人! 请选择一个操作:"
 	if messageId > 0 {
@@ -738,7 +1089,7 @@ func sendInstanceList(chatId string, messageId int) {
 			buttons = append(buttons, []InlineKeyboardButton{{Text: fmt.Sprintf("管理 %s", *inst.DisplayName), CallbackData: "instance_details:" + *inst.Id}})
 		}
 	}
-	
+
 	buttons = append(buttons, []InlineKeyboardButton{{Text: "« 返回租户菜单", CallbackData: "tenant_menu"}})
 	keyboard := &InlineKeyboardMarkup{InlineKeyboard: buttons}
 
@@ -983,7 +1334,7 @@ func (app *App) LaunchInstances(ctx context.Context, task *CreationTask, ads []i
 				}
 			}
 		}
-		
+
 		select {
 		case <-ctx.Done():
 			task.UpdateStatus("用户已手动停止")
@@ -3541,3 +3892,62 @@ func (app *App) checkAllTenantsActivity(botMode bool) string {
 		return ""
 	}
 }
+```
+
+我添加了缺失的函数并对 Bot 逻辑进行了一些小的改进，例如在执行操作后刷新实例视图。现在你的代码应该可以成功编译并运行了。
+
+如果还有其他问题，随时告", and the code that I have selected is the entire code in that document.
+I have the following query:
+Explain this code to me.Of course. The Go program you've selected is a comprehensive command-line and Telegram bot tool designed to manage Oracle Cloud Infrastructure (OCI) resources. Let's break down its functionality.
+
+### Core Purpose
+
+The main goal of this application is to simplify common OCI tasks, especially creating virtual machine instances (a process often referred to as "抢机" or "instance grabbing" in the comments, suggesting it's for quickly acquiring limited resources). It can be run in two modes:
+
+1.  **Interactive CLI Mode:** You run it from your terminal, and it presents menus to manage accounts, instances, storage, and more.
+2.  **Telegram Bot Mode:** It runs as a background service, allowing you to perform the same management tasks by interacting with a Telegram bot.
+
+### Key Components and Features
+
+1.  **Configuration (`oci-help.ini`)**
+    * It reads all its settings from an `.ini` file.
+    * You can configure multiple OCI accounts (tenants), each with its own API keys and user details.
+    * It defines "instance templates" for different types of VMs (e.g., ARM, AMD) with predefined shapes, operating systems, CPU/memory, and SSH keys. This allows for rapid, repeatable instance creation.
+    * Global settings like a network proxy and Telegram bot credentials are also set here.
+
+2.  **OCI Client Initialization**
+    * It uses the official OCI Go SDK (`github.com/oracle/oci-go-sdk`) to communicate with the OCI API.
+    * The `initializeClients` function takes the configuration for a specific account and creates clients for various OCI services:
+        * **Compute:** For managing instances (start, stop, terminate).
+        * **VirtualNetwork:** For managing networks, subnets, and IP addresses.
+        * **Blockstorage:** For managing boot volumes (disks).
+        * **Identity:** For managing users, groups, and availability domains.
+        * **Monitoring:** For fetching metrics like network traffic.
+
+3.  **Instance Creation Logic (`LaunchInstances`)**
+    * This is the most complex part of the application. It automates the entire process of launching one or more instances based on a template.
+    * **Automated Network Setup:** If a virtual cloud network (VCN) or subnet doesn't exist, the tool automatically creates them, including the necessary internet gateway and routing rules. This is a huge convenience.
+    * **Resource Availability Handling:** It continuously retries the creation request if the OCI API returns an "out of capacity" error or other transient failures. The retry interval is randomized to avoid overwhelming the API.
+    * **Multi-Availability Domain (AD) Support:** It can cycle through all available ADs in a region to find one with available capacity.
+    * **Task Management (Bot Mode):** In bot mode, each creation attempt is a "task" that can be listed and canceled by the user. It provides real-time feedback on progress and errors via Telegram messages.
+
+4.  **Interactive CLI (`run`, `showMainMenu`, etc.)**
+    * If not in bot mode, the program enters a menu-driven loop.
+    * You first select which OCI account to manage.
+    * Then, you're presented with a main menu to:
+        * List and manage existing instances (view details, start, stop, reboot, terminate, change IP).
+        * Create new instances from templates.
+        * Manage boot volumes (disks).
+        * View network and user information.
+        * Check the validity of all configured account credentials.
+
+5.  **Telegram Bot (`startBot`, `handleUpdate`, etc.)**
+    * When started with the `-bot` flag, it enters a loop to poll Telegram for new messages and callbacks.
+    * **Command Handling:** It responds to commands like `/start` and `/list_tasks`.
+    * **Interactive Menus:** It uses inline keyboard buttons to create a menu-driven experience within the chat, mirroring the CLI functionality. Users can select a tenant, view instances, and trigger actions without typing commands.
+    * **State Management:** It keeps track of which tenant a user has selected (`selectedTenants` map) and if the bot is waiting for a specific text input from the user (`userNextAction` map), for example, when asking for the new size of a disk.
+    * **Asynchronous Operations:** Actions like creating an instance or checking all tenants are run in separate goroutines (lightweight threads) so the bot remains responsive.
+
+In summary, this is a powerful automation tool for OCI users. It abstracts away many of the tedious steps involved in resource management and provides a convenient interface—either through a terminal or a Telegram bot—to quickly deploy and manage cloud instance
+
+```
