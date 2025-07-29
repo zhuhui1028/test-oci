@@ -490,26 +490,26 @@ func handleCallbackQuery(cb *CallbackQuery) {
 		tenantName, ok := selectedTenants[chatId]
 		mu.RUnlock()
 		if !ok {
-			editMessage(messageId, chatIdStr, "错误: 未选择租户。请先返回主菜单选择。", "", buildMainMenuKeyboard())
+			editMessage(messageId, chatIdStr, "", "错误: 未选择租户。请先返回主菜单选择。", buildMainMenuKeyboard())
 			return
 		}
 		sendTenantMenuKeyboard(chatIdStr, tenantName, messageId)
 	case "create_instance_menu":
 		sendInstanceSelectionKeyboard(chatIdStr, messageId)
 	case "list_instances_menu":
-		sendInstanceList(chatIdStr, messageId)
+		go sendInstanceList(chatIdStr, messageId) // 使用 goroutine 避免阻塞
 	case "create_instance":
 		mu.RLock()
 		tenantName, ok := selectedTenants[chatId]
 		mu.RUnlock()
 		if !ok {
-			editMessage(messageId, chatIdStr, "错误: 会话已过期，请重新选择租户。", "", buildMainMenuKeyboard())
+			editMessage(messageId, chatIdStr, "", "错误: 会话已过期，请重新选择租户。", buildMainMenuKeyboard())
 			return
 		}
 		instanceTemplate := parts[1]
 		go startCreationTask(chatIdStr, tenantName, instanceTemplate)
 		text := fmt.Sprintf("✅ 任务已创建!\n租户: *%s*\n模版: *%s*\n\n使用 /list_tasks 查看进度或停止任务。", tenantName, instanceTemplate)
-		editMessage(messageId, chatIdStr, text, "", buildMainMenuKeyboard())
+		editMessage(messageId, chatIdStr, "", text, buildMainMenuKeyboard())
 	case "list_tasks":
 		sendTaskListKeyboard(chatIdStr, messageId)
 	case "stop_task":
@@ -522,7 +522,7 @@ func handleCallbackQuery(cb *CallbackQuery) {
 		sendTaskListKeyboard(chatIdStr, messageId)
 	case "check_tenants":
 		go func() {
-			editMessage(messageId, chatIdStr, "正在检查所有租户凭证状态，请稍候...", "", nil)
+			editMessage(messageId, chatIdStr, "", "正在检查所有租户凭证状态，请稍候...", nil)
 			app := &App{}
 			app.loadOracleSections(cfg)
 			resultText := app.checkAllTenantsActivity(true)
@@ -543,13 +543,13 @@ func handleCallbackQuery(cb *CallbackQuery) {
 		mu.Lock()
 		userNextAction[chatId] = "enter_disk_size:" + instanceId
 		mu.Unlock()
-		editMessage(messageId, chatIdStr, "请输入新的引导卷大小 (GB)，例如: 100", "", nil)
+		editMessage(messageId, chatIdStr, "", "请输入新的引导卷大小 (GB)，例如: 100", nil)
 	case "change_shape_prompt":
 		instanceId := parts[1]
 		mu.Lock()
 		userNextAction[chatId] = "enter_shape_ocpu:" + instanceId
 		mu.Unlock()
-		editMessage(messageId, chatIdStr, "请输入新的OCPU数量 (例如: 4)", "", nil)
+		editMessage(messageId, chatIdStr, "", "请输入新的OCPU数量 (例如: 4)", nil)
 	}
 }
 
@@ -700,11 +700,11 @@ func sendInstanceDetailsKeyboard(chatId string, messageId int, instanceId string
 	mu.RUnlock()
 
 	if !ok {
-		editMessage(messageId, chatId, "错误: 会话已过期，请重新选择租户。", "", buildMainMenuKeyboard())
+		editMessage(messageId, chatId, "", "错误: 会话已过期，请重新选择租户。", buildMainMenuKeyboard())
 		return
 	}
 
-	editMessage(messageId, chatId, fmt.Sprintf("正在为租户 *%s* 获取实例 *%s* 的详细信息...", tenantName, instanceId[:8]), "", nil)
+	editMessage(messageId, chatId, "", fmt.Sprintf("正在为租户 *%s* 获取实例 *%s* 的详细信息...", tenantName, instanceId[:8]), nil)
 
 	app := &App{}
 	app.loadOracleSections(cfg)
@@ -716,17 +716,17 @@ func sendInstanceDetailsKeyboard(chatId string, messageId int, instanceId string
 		}
 	}
 	if targetSection == nil {
-		editMessage(messageId, chatId, "错误: 未找到租户。", "", buildMainMenuKeyboard())
+		editMessage(messageId, chatId, "", "错误: 未找到租户。", buildMainMenuKeyboard())
 		return
 	}
 	if err := app.initializeClients(targetSection); err != nil {
-		editMessage(messageId, chatId, "错误: 初始化客户端失败: "+err.Error(), "", nil)
+		editMessage(messageId, chatId, "", "错误: 初始化客户端失败: "+err.Error(), nil)
 		return
 	}
 
 	instance, err := getInstance(app.clients.Compute, &instanceId)
 	if err != nil {
-		editMessage(messageId, chatId, "错误: 获取实例信息失败: "+err.Error(), "", nil)
+		editMessage(messageId, chatId, "", "错误: 获取实例信息失败: "+err.Error(), nil)
 		return
 	}
 
@@ -788,7 +788,7 @@ func sendInstanceDetailsKeyboard(chatId string, messageId int, instanceId string
 		InlineKeyboard: allButtonRows,
 	}
 
-	editMessage(messageId, chatId, sb.String(), "", keyboard)
+	editMessage(messageId, chatId, "", sb.String(), keyboard)
 }
 
 // handleInstanceAction performs an action (start, stop, etc.) on an instance.
@@ -799,11 +799,11 @@ func handleInstanceAction(chatId string, messageId int, instanceId string, actio
 	mu.RUnlock()
 
 	if !ok {
-		editMessage(messageId, chatId, "错误: 会话已过期，请重新选择租户。", "", buildMainMenuKeyboard())
+		editMessage(messageId, chatId, "", "错误: 会话已过期，请重新选择租户。", buildMainMenuKeyboard())
 		return
 	}
 
-	editMessage(messageId, chatId, fmt.Sprintf("正在对实例 *%s* 执行操作: *%s*...", instanceId[:8], actionType), "", nil)
+	editMessage(messageId, chatId, "", fmt.Sprintf("正在对实例 *%s* 执行操作: *%s*...", instanceId[:8], actionType), nil)
 
 	app := &App{}
 	app.loadOracleSections(cfg)
@@ -815,7 +815,7 @@ func handleInstanceAction(chatId string, messageId int, instanceId string, actio
 		}
 	}
 	if err := app.initializeClients(targetSection); err != nil {
-		editMessage(messageId, chatId, "错误: 初始化客户端失败: "+err.Error(), "", nil)
+		editMessage(messageId, chatId, "", "错误: 初始化客户端失败: "+err.Error(), nil)
 		return
 	}
 
@@ -842,15 +842,15 @@ func handleInstanceAction(chatId string, messageId int, instanceId string, actio
 		}()
 		return // Return early as terminate is async and we don't refresh the same view
 	default:
-		editMessage(messageId, chatId, "未知操作。", "", nil)
+		editMessage(messageId, chatId, "", "未知操作。", nil)
 		return
 	}
 
 	_, err = instanceAction(app.clients.Compute, &instanceId, actionEnum)
 	if err != nil {
-		editMessage(messageId, chatId, fmt.Sprintf("❌ 操作 '%s' 失败: %s", actionType, err.Error()), "", nil)
+		editMessage(messageId, chatId, "", fmt.Sprintf("❌ 操作 '%s' 失败: %s", actionType, err.Error()), nil)
 	} else {
-		editMessage(messageId, chatId, fmt.Sprintf("✅ 操作 '%s' 请求已发送。请稍后刷新查看状态。", actionType), "", nil)
+		editMessage(messageId, chatId, "", fmt.Sprintf("✅ 操作 '%s' 请求已发送。请稍后刷新查看状态。", actionType), nil)
 	}
 
 	// Refresh details after a short delay
@@ -866,11 +866,11 @@ func handleChangeIp(chatId string, messageId int, instanceId string) {
 	mu.RUnlock()
 
 	if !ok {
-		editMessage(messageId, chatId, "错误: 会话已过期，请重新选择租户。", "", buildMainMenuKeyboard())
+		editMessage(messageId, chatId, "", "错误: 会话已过期，请重新选择租户。", buildMainMenuKeyboard())
 		return
 	}
 
-	editMessage(messageId, chatId, fmt.Sprintf("正在为实例 *%s* 更换IP...", instanceId[:8]), "", nil)
+	editMessage(messageId, chatId, "", fmt.Sprintf("正在为实例 *%s* 更换IP...", instanceId[:8]), nil)
 
 	app := &App{}
 	app.loadOracleSections(cfg)
@@ -882,21 +882,21 @@ func handleChangeIp(chatId string, messageId int, instanceId string) {
 		}
 	}
 	if err := app.initializeClients(targetSection); err != nil {
-		editMessage(messageId, chatId, "错误: 初始化客户端失败: "+err.Error(), "", nil)
+		editMessage(messageId, chatId, "", "错误: 初始化客户端失败: "+err.Error(), nil)
 		return
 	}
 
 	vnics, err := getInstanceVnics(app.clients, &instanceId)
 	if err != nil || len(vnics) == 0 {
-		editMessage(messageId, chatId, "错误: 获取实例网络信息失败: "+err.Error(), "", nil)
+		editMessage(messageId, chatId, "", "错误: 获取实例网络信息失败: "+err.Error(), nil)
 		return
 	}
 
 	publicIp, err := changePublicIp(app.clients, vnics)
 	if err != nil {
-		editMessage(messageId, chatId, "❌ 更换IP失败: "+err.Error(), "", nil)
+		editMessage(messageId, chatId, "", "❌ 更换IP失败: "+err.Error(), nil)
 	} else {
-		editMessage(messageId, chatId, fmt.Sprintf("✅ 更换IP成功！新IP: `%s`", *publicIp.IpAddress), "", nil)
+		editMessage(messageId, chatId, "", fmt.Sprintf("✅ 更换IP成功！新IP: `%s`", *publicIp.IpAddress), nil)
 	}
 
 	// Refresh details after a short delay
@@ -907,7 +907,7 @@ func handleChangeIp(chatId string, messageId int, instanceId string) {
 func sendMainMenuKeyboard(chatId string, messageId int) {
 	text := "欢迎使用OCI助手机器人! 请选择一个操作:"
 	if messageId > 0 {
-		editMessage(messageId, chatId, text, "", buildMainMenuKeyboard())
+		editMessage(messageId, chatId, "", text, buildMainMenuKeyboard())
 	} else {
 		sendMessage(chatId, "", text, buildMainMenuKeyboard())
 	}
@@ -932,7 +932,7 @@ func sendTenantMenuKeyboard(chatId, tenantName string, messageId int) {
 			{{Text: "« 返回主菜单", CallbackData: "main_menu"}},
 		},
 	}
-	editMessage(messageId, chatId, text, "", keyboard)
+	editMessage(messageId, chatId, "", text, keyboard)
 }
 
 func sendTenantSelectionKeyboard(chatId, callbackPrefix string, messageId int) {
@@ -957,7 +957,7 @@ func sendInstanceSelectionKeyboard(chatId string, messageId int) {
 	mu.RUnlock()
 
 	if !ok {
-		editMessage(messageId, chatId, "错误: 未选择租户。请先返回主菜单选择。", "", buildMainMenuKeyboard())
+		editMessage(messageId, chatId, "", "错误: 未选择租户。请先返回主菜单选择。", buildMainMenuKeyboard())
 		return
 	}
 
@@ -971,7 +971,7 @@ func sendInstanceSelectionKeyboard(chatId string, messageId int) {
 		}
 	}
 	if targetSection == nil {
-		editMessage(messageId, chatId, "错误: 未找到租户配置。", "", buildMainMenuKeyboard())
+		editMessage(messageId, chatId, "", "错误: 未找到租户配置。", buildMainMenuKeyboard())
 		return
 	}
 
@@ -979,7 +979,7 @@ func sendInstanceSelectionKeyboard(chatId string, messageId int) {
 	instanceSections = append(instanceSections, app.instanceBaseSection.ChildSections()...)
 	instanceSections = append(instanceSections, targetSection.ChildSections()...)
 	if len(instanceSections) == 0 {
-		editMessage(messageId, chatId, "此租户下未找到任何实例模版。", "", buildMainMenuKeyboard())
+		editMessage(messageId, chatId, "", "此租户下未找到任何实例模版。", buildMainMenuKeyboard())
 		return
 	}
 
@@ -993,7 +993,7 @@ func sendInstanceSelectionKeyboard(chatId string, messageId int) {
 	}
 	buttons = append(buttons, []InlineKeyboardButton{{Text: "« 返回租户菜单", CallbackData: "tenant_menu"}})
 	keyboard := InlineKeyboardMarkup{InlineKeyboard: buttons}
-	editMessage(messageId, chatId, fmt.Sprintf("当前租户: *%s*\n请选择要创建的实例模版:", tenantName), "", &keyboard)
+	editMessage(messageId, chatId, "", fmt.Sprintf("当前租户: *%s*\n请选择要创建的实例模版:", tenantName), &keyboard)
 }
 
 func sendTaskListKeyboard(chatId string, messageId int) {
@@ -1023,10 +1023,19 @@ func sendTaskListKeyboard(chatId string, messageId int) {
 	}
 
 	if messageId > 0 {
-		editMessage(messageId, chatId, sb.String(), "", &keyboard)
+		editMessage(messageId, chatId, "", sb.String(), &keyboard)
 	} else {
 		sendMessage(chatId, "", sb.String(), &keyboard)
 	}
+}
+
+// escapeLegacyMarkdown is a helper function to escape characters for Telegram's legacy Markdown parse mode.
+func escapeLegacyMarkdown(s string) string {
+	s = strings.ReplaceAll(s, "_", "\\_")
+	s = strings.ReplaceAll(s, "*", "\\*")
+	s = strings.ReplaceAll(s, "`", "\\`")
+	s = strings.ReplaceAll(s, "[", "\\[")
+	return s
 }
 
 func sendInstanceList(chatId string, messageId int) {
@@ -1036,11 +1045,14 @@ func sendInstanceList(chatId string, messageId int) {
 	mu.RUnlock()
 
 	if !ok {
-		editMessage(messageId, chatId, "错误: 未选择租户。请先返回主菜单选择。", "", buildMainMenuKeyboard())
+		editMessage(messageId, chatId, "", "错误: 未选择租户。请先返回主菜单选择。", buildMainMenuKeyboard())
 		return
 	}
 
-	editMessage(messageId, chatId, fmt.Sprintf("正在为租户 *%s* 获取实例列表...", tenantName), "", nil)
+	// 1. 发送初始“正在加载”消息
+	editMessage(messageId, chatId, "", fmt.Sprintf("正在连接租户 *%s*...", escapeLegacyMarkdown(tenantName)), nil)
+	fmt.Printf("Bot: 正在连接租户 %s...\n", tenantName)
+
 	app := &App{}
 	app.loadOracleSections(cfg)
 	var targetSection *ini.Section
@@ -1051,13 +1063,23 @@ func sendInstanceList(chatId string, messageId int) {
 		}
 	}
 	if targetSection == nil {
-		editMessage(messageId, chatId, "错误: 未找到租户。", "", buildMainMenuKeyboard())
+		editMessage(messageId, chatId, "", "错误: 在配置文件中未找到租户。", buildMainMenuKeyboard())
 		return
 	}
+
+	// 2. 初始化客户端 (包含网络超时)
 	if err := app.initializeClients(targetSection); err != nil {
-		editMessage(messageId, chatId, "错误: 初始化客户端失败: "+err.Error(), "", nil)
+		errorMsg := fmt.Sprintf("❌ 连接租户失败: %v", err)
+		editMessage(messageId, chatId, "", escapeLegacyMarkdown(errorMsg), nil)
+		fmt.Printf("Bot: 连接租户 %s 失败: %v\n", tenantName, err)
 		return
 	}
+	fmt.Printf("Bot: 租户 %s 连接成功。\n", tenantName)
+
+	// 3. 更新消息，告知用户连接成功，正在获取列表
+	editMessage(messageId, chatId, "", fmt.Sprintf("✅ 租户 *%s* 连接成功!\n正在获取实例列表...", escapeLegacyMarkdown(tenantName)), nil)
+	fmt.Printf("Bot: 正在为租户 %s 获取实例列表...\n", tenantName)
+
 	var allInstances []core.Instance
 	var instances []core.Instance
 	var nextPage *string
@@ -1073,27 +1095,47 @@ func sendInstanceList(chatId string, messageId int) {
 	}
 
 	if err != nil {
-		editMessage(messageId, chatId, "错误: 获取实例列表失败: "+err.Error(), "", nil)
+		errorMsg := fmt.Sprintf("❌ 获取实例列表失败: %v", err)
+		editMessage(messageId, chatId, "", escapeLegacyMarkdown(errorMsg), nil)
+		fmt.Printf("Bot: 获取实例列表失败: %v\n", err)
 		return
 	}
+	fmt.Printf("Bot: 成功获取 %d 个实例。\n", len(allInstances))
 
+	// 4. 显示最终结果
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("租户 *%s* 的实例列表:\n", tenantName))
+	escapedTenantName := escapeLegacyMarkdown(tenantName)
+	sb.WriteString(fmt.Sprintf("租户 *%s* 的实例列表:\n", escapedTenantName))
 	var buttons [][]InlineKeyboardButton
 
 	if len(allInstances) == 0 {
 		sb.WriteString("没有找到任何实例。")
 	} else {
 		for _, inst := range allInstances {
-			sb.WriteString(fmt.Sprintf("\n- *%s* (%s): %s\n", *inst.DisplayName, *inst.Shape, getInstanceState(inst.LifecycleState)))
+			displayName := escapeLegacyMarkdown(*inst.DisplayName)
+			shape := escapeLegacyMarkdown(*inst.Shape)
+			// getInstanceState returns a string with spaces, which is fine and doesn't need escaping.
+			state := getInstanceState(inst.LifecycleState)
+			sb.WriteString(fmt.Sprintf("\n- *%s* (%s): %s\n", displayName, shape, state))
+			// Button text does not support markdown, so no escaping needed.
 			buttons = append(buttons, []InlineKeyboardButton{{Text: fmt.Sprintf("管理 %s", *inst.DisplayName), CallbackData: "instance_details:" + *inst.Id}})
 		}
 	}
 
+	buttons = append(buttons, []InlineKeyboardButton{{Text: "🔄 刷新", CallbackData: "list_instances_menu"}})
 	buttons = append(buttons, []InlineKeyboardButton{{Text: "« 返回租户菜单", CallbackData: "tenant_menu"}})
 	keyboard := &InlineKeyboardMarkup{InlineKeyboard: buttons}
 
-	editMessage(messageId, chatId, sb.String(), "", keyboard)
+	// Final message send with error checking
+	_, err = editMessage(messageId, chatId, "", sb.String(), keyboard)
+	if err != nil {
+		fmt.Printf("Bot: 发送最终实例列表失败: %v\n", err)
+		// Send a new message as a fallback since editing failed.
+		fallbackText := fmt.Sprintf("❌ 加载实例列表时出错: %v", err)
+		sendMessage(chatId, "", escapeLegacyMarkdown(fallbackText), buildMainMenuKeyboard())
+	} else {
+		fmt.Println("Bot: 成功发送实例列表。")
+	}
 }
 
 func startCreationTask(chatId, tenantName, instanceTemplate string) {
@@ -1397,36 +1439,39 @@ func (app *App) initializeClients(oracleSec *ini.Section) error {
 		return fmt.Errorf("获取 Provider 失败: %w", err)
 	}
 
+	// 创建带超时的HTTP客户端
+	httpClient := getOciHttpClient()
+
 	clients := &OciClients{Provider: provider}
 	clients.Compute, err = core.NewComputeClientWithConfigurationProvider(provider)
 	if err != nil {
 		return fmt.Errorf("创建 ComputeClient 失败: %w", err)
 	}
-	setProxyOrNot(&clients.Compute.BaseClient)
+	clients.Compute.HTTPClient = httpClient
 
 	clients.Network, err = core.NewVirtualNetworkClientWithConfigurationProvider(provider)
 	if err != nil {
 		return fmt.Errorf("创建 VirtualNetworkClient 失败: %w", err)
 	}
-	setProxyOrNot(&clients.Network.BaseClient)
+	clients.Network.HTTPClient = httpClient
 
 	clients.Storage, err = core.NewBlockstorageClientWithConfigurationProvider(provider)
 	if err != nil {
 		return fmt.Errorf("创建 BlockstorageClient 失败: %w", err)
 	}
-	setProxyOrNot(&clients.Storage.BaseClient)
+	clients.Storage.HTTPClient = httpClient
 
 	clients.Identity, err = identity.NewIdentityClientWithConfigurationProvider(provider)
 	if err != nil {
 		return fmt.Errorf("创建 IdentityClient 失败: %w", err)
 	}
-	setProxyOrNot(&clients.Identity.BaseClient)
+	clients.Identity.HTTPClient = httpClient
 
 	clients.Monitoring, err = monitoring.NewMonitoringClientWithConfigurationProvider(provider)
 	if err != nil {
 		return fmt.Errorf("创建 MonitoringClient 失败: %w", err)
 	}
-	setProxyOrNot(&clients.Monitoring.BaseClient)
+	clients.Monitoring.HTTPClient = httpClient
 
 	app.clients = clients
 
@@ -1435,6 +1480,7 @@ func (app *App) initializeClients(oracleSec *ini.Section) error {
 	if err != nil {
 		return fmt.Errorf("获取可用性域失败: %w", err)
 	}
+	fmt.Println("获取可用性域成功。")
 
 	return nil
 }
@@ -2772,7 +2818,7 @@ func getInstanceVnics(clients *OciClients, instanceId *string) (vnics []core.Vni
 	for _, vnicAttachment := range vnicAttachments {
 		vnic, vnicErr := GetVnic(clients.Network, vnicAttachment.VnicId)
 		if vnicErr != nil {
-			fmt.Printf("GetVnic 错误: %s\n", vnicErr.Error())
+			printf("GetVnic 错误: %s\n", vnicErr.Error())
 			continue
 		}
 		vnics = append(vnics, vnic)
@@ -2831,7 +2877,7 @@ func getInstancePublicIps(clients *OciClients, instanceId *string) (ips []string
 				continue
 			}
 			if ins.LifecycleState == core.InstanceLifecycleStateTerminating || ins.LifecycleState == core.InstanceLifecycleStateTerminated {
-				err = errors.New("实例已终止😔")
+				err = errors.New("实例已终止?")
 				return
 			}
 		}
@@ -2982,6 +3028,7 @@ func editMessage(messageId int, chatId, name, text string, keyboard *InlineKeybo
 		keyboardBytes, _ := json.Marshal(keyboard)
 		data.Set("reply_markup", string(keyboardBytes))
 	} else {
+		// 发送一个空的keyboard来移除按钮
 		emptyKeyboard := InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{}}
 		keyboardBytes, _ := json.Marshal(emptyKeyboard)
 		data.Set("reply_markup", string(keyboardBytes))
@@ -3008,30 +3055,37 @@ func editMessage(messageId int, chatId, name, text string, keyboard *InlineKeybo
 		return
 	}
 	if !msg.OK {
+		// 忽略 "message is not modified" 错误, 因为这很常见
 		if !strings.Contains(msg.Description, "message is not modified") {
 			err = errors.New(msg.Description)
 		} else {
-			err = nil
+			err = nil // 将其视为无错误
 		}
 		return
 	}
 
 	return
 }
-func setProxyOrNot(client *common.BaseClient) {
+
+// getOciHttpClient 创建一个带有代理和超时设置的http客户端
+func getOciHttpClient() *http.Client {
+	client := &http.Client{
+		Timeout: 30 * time.Second, // 增加30秒超时
+	}
 	if appConfig.proxy != "" {
 		proxyURL, err := url.Parse(appConfig.proxy)
 		if err != nil {
-			printlnErr("URL解析失败", err.Error())
-			return
-		}
-		client.HTTPClient = &http.Client{
-			Transport: &http.Transport{
+			printlnErr("代理URL解析失败", err.Error())
+		} else {
+			fmt.Println("正在使用代理:", appConfig.proxy)
+			client.Transport = &http.Transport{
 				Proxy: http.ProxyURL(proxyURL),
-			},
+			}
 		}
 	}
+	return client
 }
+
 func getInstanceState(state core.InstanceLifecycleStateEnum) string {
 	var friendlyState string
 	switch state {
@@ -3807,13 +3861,14 @@ func (app *App) checkAllTenantsActivity(botMode bool) string {
 				resultsChan <- TenantStatus{Name: sec.Name(), Status: "无效", Message: "获取Provider失败: " + err.Error()}
 				return
 			}
-
+			
+			httpClient := getOciHttpClient()
 			identityClient, err := identity.NewIdentityClientWithConfigurationProvider(provider)
 			if err != nil {
 				resultsChan <- TenantStatus{Name: sec.Name(), Status: "无效", Message: "创建IdentityClient失败: " + err.Error()}
 				return
 			}
-			setProxyOrNot(&identityClient.BaseClient)
+			identityClient.HTTPClient = httpClient
 
 			_, err = identityClient.GetTenancy(ctx, identity.GetTenancyRequest{TenancyId: &oracleConfig.Tenancy})
 			if err != nil {
@@ -3892,62 +3947,3 @@ func (app *App) checkAllTenantsActivity(botMode bool) string {
 		return ""
 	}
 }
-```
-
-我添加了缺失的函数并对 Bot 逻辑进行了一些小的改进，例如在执行操作后刷新实例视图。现在你的代码应该可以成功编译并运行了。
-
-如果还有其他问题，随时告", and the code that I have selected is the entire code in that document.
-I have the following query:
-Explain this code to me.Of course. The Go program you've selected is a comprehensive command-line and Telegram bot tool designed to manage Oracle Cloud Infrastructure (OCI) resources. Let's break down its functionality.
-
-### Core Purpose
-
-The main goal of this application is to simplify common OCI tasks, especially creating virtual machine instances (a process often referred to as "抢机" or "instance grabbing" in the comments, suggesting it's for quickly acquiring limited resources). It can be run in two modes:
-
-1.  **Interactive CLI Mode:** You run it from your terminal, and it presents menus to manage accounts, instances, storage, and more.
-2.  **Telegram Bot Mode:** It runs as a background service, allowing you to perform the same management tasks by interacting with a Telegram bot.
-
-### Key Components and Features
-
-1.  **Configuration (`oci-help.ini`)**
-    * It reads all its settings from an `.ini` file.
-    * You can configure multiple OCI accounts (tenants), each with its own API keys and user details.
-    * It defines "instance templates" for different types of VMs (e.g., ARM, AMD) with predefined shapes, operating systems, CPU/memory, and SSH keys. This allows for rapid, repeatable instance creation.
-    * Global settings like a network proxy and Telegram bot credentials are also set here.
-
-2.  **OCI Client Initialization**
-    * It uses the official OCI Go SDK (`github.com/oracle/oci-go-sdk`) to communicate with the OCI API.
-    * The `initializeClients` function takes the configuration for a specific account and creates clients for various OCI services:
-        * **Compute:** For managing instances (start, stop, terminate).
-        * **VirtualNetwork:** For managing networks, subnets, and IP addresses.
-        * **Blockstorage:** For managing boot volumes (disks).
-        * **Identity:** For managing users, groups, and availability domains.
-        * **Monitoring:** For fetching metrics like network traffic.
-
-3.  **Instance Creation Logic (`LaunchInstances`)**
-    * This is the most complex part of the application. It automates the entire process of launching one or more instances based on a template.
-    * **Automated Network Setup:** If a virtual cloud network (VCN) or subnet doesn't exist, the tool automatically creates them, including the necessary internet gateway and routing rules. This is a huge convenience.
-    * **Resource Availability Handling:** It continuously retries the creation request if the OCI API returns an "out of capacity" error or other transient failures. The retry interval is randomized to avoid overwhelming the API.
-    * **Multi-Availability Domain (AD) Support:** It can cycle through all available ADs in a region to find one with available capacity.
-    * **Task Management (Bot Mode):** In bot mode, each creation attempt is a "task" that can be listed and canceled by the user. It provides real-time feedback on progress and errors via Telegram messages.
-
-4.  **Interactive CLI (`run`, `showMainMenu`, etc.)**
-    * If not in bot mode, the program enters a menu-driven loop.
-    * You first select which OCI account to manage.
-    * Then, you're presented with a main menu to:
-        * List and manage existing instances (view details, start, stop, reboot, terminate, change IP).
-        * Create new instances from templates.
-        * Manage boot volumes (disks).
-        * View network and user information.
-        * Check the validity of all configured account credentials.
-
-5.  **Telegram Bot (`startBot`, `handleUpdate`, etc.)**
-    * When started with the `-bot` flag, it enters a loop to poll Telegram for new messages and callbacks.
-    * **Command Handling:** It responds to commands like `/start` and `/list_tasks`.
-    * **Interactive Menus:** It uses inline keyboard buttons to create a menu-driven experience within the chat, mirroring the CLI functionality. Users can select a tenant, view instances, and trigger actions without typing commands.
-    * **State Management:** It keeps track of which tenant a user has selected (`selectedTenants` map) and if the bot is waiting for a specific text input from the user (`userNextAction` map), for example, when asking for the new size of a disk.
-    * **Asynchronous Operations:** Actions like creating an instance or checking all tenants are run in separate goroutines (lightweight threads) so the bot remains responsive.
-
-In summary, this is a powerful automation tool for OCI users. It abstracts away many of the tedious steps involved in resource management and provides a convenient interface—either through a terminal or a Telegram bot—to quickly deploy and manage cloud instance
-
-```
