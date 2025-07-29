@@ -85,6 +85,10 @@ var (
 	selectedTenants = make(map[int64]string) // 存储每个聊天的已选租户
 	userNextAction  = make(map[int64]string) // 存储用户的下一个预期操作
 	mu              sync.RWMutex             // 用于保护并发访问map
+
+	// 新增: 用于缓存每个聊天的实例列表
+	instanceListCache  = make(map[int64][]core.Instance)
+	instanceCacheMutex sync.RWMutex
 )
 
 // 单个OCI账户的配置
@@ -529,8 +533,26 @@ func handleCallbackQuery(cb *CallbackQuery) {
 			editMessage(messageId, chatIdStr, "所有租户凭证检查完成:", resultText, buildMainMenuKeyboard())
 		}()
 	case "instance_details":
-		instanceId := parts[1]
+		// --- 修改开始 ---
+		instanceIndexStr := parts[1]
+		instanceIndex, err := strconv.Atoi(instanceIndexStr)
+		if err != nil {
+			editMessage(messageId, chatIdStr, "", "错误: 无效的实例引用。", buildMainMenuKeyboard())
+			return
+		}
+
+		instanceCacheMutex.RLock()
+		cachedInstances, found := instanceListCache[chatId]
+		instanceCacheMutex.RUnlock()
+
+		if !found || instanceIndex >= len(cachedInstances) {
+			editMessage(messageId, chatIdStr, "", "错误: 实例列表已过期，请刷新。", buildMainMenuKeyboard())
+			return
+		}
+
+		instanceId := *cachedInstances[instanceIndex].Id
 		sendInstanceDetailsKeyboard(chatIdStr, messageId, instanceId)
+		// --- 修改结束 ---
 	case "instance_action":
 		actionType := parts[1]
 		instanceId := parts[2]
@@ -1049,7 +1071,6 @@ func sendInstanceList(chatId string, messageId int) {
 		return
 	}
 
-	// 1. 发送初始“正在加载”消息
 	editMessage(messageId, chatId, "", fmt.Sprintf("正在连接租户 *%s*...", escapeLegacyMarkdown(tenantName)), nil)
 	fmt.Printf("Bot: 正在连接租户 %s...\n", tenantName)
 
@@ -1067,7 +1088,6 @@ func sendInstanceList(chatId string, messageId int) {
 		return
 	}
 
-	// 2. 初始化客户端 (包含网络超时)
 	if err := app.initializeClients(targetSection); err != nil {
 		errorMsg := fmt.Sprintf("❌ 连接租户失败: %v", err)
 		editMessage(messageId, chatId, "", escapeLegacyMarkdown(errorMsg), nil)
@@ -1076,7 +1096,6 @@ func sendInstanceList(chatId string, messageId int) {
 	}
 	fmt.Printf("Bot: 租户 %s 连接成功。\n", tenantName)
 
-	// 3. 更新消息，告知用户连接成功，正在获取列表
 	editMessage(messageId, chatId, "", fmt.Sprintf("✅ 租户 *%s* 连接成功!\n正在获取实例列表...", escapeLegacyMarkdown(tenantName)), nil)
 	fmt.Printf("Bot: 正在为租户 %s 获取实例列表...\n", tenantName)
 
@@ -1102,7 +1121,13 @@ func sendInstanceList(chatId string, messageId int) {
 	}
 	fmt.Printf("Bot: 成功获取 %d 个实例。\n", len(allInstances))
 
-	// 4. 显示最终结果
+	// --- 修改开始 ---
+	// 将获取到的实例列表存入缓存
+	instanceCacheMutex.Lock()
+	instanceListCache[chatIdInt] = allInstances
+	instanceCacheMutex.Unlock()
+	// --- 修改结束 ---
+
 	var sb strings.Builder
 	escapedTenantName := escapeLegacyMarkdown(tenantName)
 	sb.WriteString(fmt.Sprintf("租户 *%s* 的实例列表:\n", escapedTenantName))
@@ -1111,14 +1136,19 @@ func sendInstanceList(chatId string, messageId int) {
 	if len(allInstances) == 0 {
 		sb.WriteString("没有找到任何实例。")
 	} else {
-		for _, inst := range allInstances {
+		for i, inst := range allInstances { // 注意这里使用了索引 i
 			displayName := escapeLegacyMarkdown(*inst.DisplayName)
 			shape := escapeLegacyMarkdown(*inst.Shape)
-			// getInstanceState returns a string with spaces, which is fine and doesn't need escaping.
 			state := getInstanceState(inst.LifecycleState)
 			sb.WriteString(fmt.Sprintf("\n- *%s* (%s): %s\n", displayName, shape, state))
-			// Button text does not support markdown, so no escaping needed.
-			buttons = append(buttons, []InlineKeyboardButton{{Text: fmt.Sprintf("管理 %s", *inst.DisplayName), CallbackData: "instance_details:" + *inst.Id}})
+
+			// --- 修改开始 ---
+			// 使用索引作为 callback_data
+			buttons = append(buttons, []InlineKeyboardButton{{
+				Text:         fmt.Sprintf("管理 %s", *inst.DisplayName),
+				CallbackData: "instance_details:" + strconv.Itoa(i), // 使用索引
+			}})
+			// --- 修改结束 ---
 		}
 	}
 
@@ -1126,11 +1156,9 @@ func sendInstanceList(chatId string, messageId int) {
 	buttons = append(buttons, []InlineKeyboardButton{{Text: "« 返回租户菜单", CallbackData: "tenant_menu"}})
 	keyboard := &InlineKeyboardMarkup{InlineKeyboard: buttons}
 
-	// Final message send with error checking
 	_, err = editMessage(messageId, chatId, "", sb.String(), keyboard)
 	if err != nil {
 		fmt.Printf("Bot: 发送最终实例列表失败: %v\n", err)
-		// Send a new message as a fallback since editing failed.
 		fallbackText := fmt.Sprintf("❌ 加载实例列表时出错: %v", err)
 		sendMessage(chatId, "", escapeLegacyMarkdown(fallbackText), buildMainMenuKeyboard())
 	} else {
