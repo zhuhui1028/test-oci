@@ -533,46 +533,71 @@ func handleCallbackQuery(cb *CallbackQuery) {
 			editMessage(messageId, chatIdStr, "所有租户凭证检查完成:", resultText, buildMainMenuKeyboard())
 		}()
 	case "instance_details":
-		// --- 修改开始 ---
 		instanceIndexStr := parts[1]
-		instanceIndex, err := strconv.Atoi(instanceIndexStr)
+		instanceId, err := getInstanceIdFromCache(chatId, instanceIndexStr)
 		if err != nil {
-			editMessage(messageId, chatIdStr, "", "错误: 无效的实例引用。", buildMainMenuKeyboard())
+			editMessage(messageId, chatIdStr, "", "错误: "+err.Error(), buildMainMenuKeyboard())
 			return
 		}
-
-		instanceCacheMutex.RLock()
-		cachedInstances, found := instanceListCache[chatId]
-		instanceCacheMutex.RUnlock()
-
-		if !found || instanceIndex >= len(cachedInstances) {
-			editMessage(messageId, chatIdStr, "", "错误: 实例列表已过期，请刷新。", buildMainMenuKeyboard())
-			return
-		}
-
-		instanceId := *cachedInstances[instanceIndex].Id
-		sendInstanceDetailsKeyboard(chatIdStr, messageId, instanceId)
-		// --- 修改结束 ---
+		sendInstanceDetailsKeyboard(chatIdStr, messageId, instanceId, instanceIndexStr)
 	case "instance_action":
 		actionType := parts[1]
-		instanceId := parts[2]
-		handleInstanceAction(chatIdStr, messageId, instanceId, actionType)
+		instanceIndexStr := parts[2]
+		instanceId, err := getInstanceIdFromCache(chatId, instanceIndexStr)
+		if err != nil {
+			editMessage(messageId, chatIdStr, "", "错误: "+err.Error(), buildMainMenuKeyboard())
+			return
+		}
+		handleInstanceAction(chatIdStr, messageId, instanceId, actionType, instanceIndexStr)
 	case "change_ip":
-		instanceId := parts[1]
-		handleChangeIp(chatIdStr, messageId, instanceId)
+		instanceIndexStr := parts[1]
+		instanceId, err := getInstanceIdFromCache(chatId, instanceIndexStr)
+		if err != nil {
+			editMessage(messageId, chatIdStr, "", "错误: "+err.Error(), buildMainMenuKeyboard())
+			return
+		}
+		handleChangeIp(chatIdStr, messageId, instanceId, instanceIndexStr)
 	case "resize_disk_prompt":
-		instanceId := parts[1]
+		instanceIndexStr := parts[1]
+		instanceId, err := getInstanceIdFromCache(chatId, instanceIndexStr)
+		if err != nil {
+			editMessage(messageId, chatIdStr, "", "错误: "+err.Error(), buildMainMenuKeyboard())
+			return
+		}
 		mu.Lock()
 		userNextAction[chatId] = "enter_disk_size:" + instanceId
 		mu.Unlock()
 		editMessage(messageId, chatIdStr, "", "请输入新的引导卷大小 (GB)，例如: 100", nil)
 	case "change_shape_prompt":
-		instanceId := parts[1]
+		instanceIndexStr := parts[1]
+		instanceId, err := getInstanceIdFromCache(chatId, instanceIndexStr)
+		if err != nil {
+			editMessage(messageId, chatIdStr, "", "错误: "+err.Error(), buildMainMenuKeyboard())
+			return
+		}
 		mu.Lock()
 		userNextAction[chatId] = "enter_shape_ocpu:" + instanceId
 		mu.Unlock()
 		editMessage(messageId, chatIdStr, "", "请输入新的OCPU数量 (例如: 4)", nil)
 	}
+}
+
+// getInstanceIdFromCache is a helper function to get instanceId from cache using index.
+func getInstanceIdFromCache(chatId int64, instanceIndexStr string) (string, error) {
+	instanceIndex, err := strconv.Atoi(instanceIndexStr)
+	if err != nil {
+		return "", errors.New("无效的实例引用")
+	}
+
+	instanceCacheMutex.RLock()
+	cachedInstances, found := instanceListCache[chatId]
+	instanceCacheMutex.RUnlock()
+
+	if !found || instanceIndex < 0 || instanceIndex >= len(cachedInstances) {
+		return "", errors.New("实例列表已过期或无效，请刷新")
+	}
+
+	return *cachedInstances[instanceIndex].Id, nil
 }
 
 // handleUserInput handles text input when the bot is expecting a specific response.
@@ -715,7 +740,7 @@ func handleUserInput(msg *TgMessage, action string) {
 }
 
 // sendInstanceDetailsKeyboard displays details for a specific instance with action buttons.
-func sendInstanceDetailsKeyboard(chatId string, messageId int, instanceId string) {
+func sendInstanceDetailsKeyboard(chatId string, messageId int, instanceId string, instanceIndex string) {
 	chatIdInt, _ := strconv.ParseInt(chatId, 10, 64)
 	mu.RLock()
 	tenantName, ok := selectedTenants[chatIdInt]
@@ -772,35 +797,35 @@ func sendInstanceDetailsKeyboard(chatId string, messageId int, instanceId string
 	var actionButtons [][]InlineKeyboardButton
 	if state == core.InstanceLifecycleStateStopped {
 		actionButtons = append(actionButtons, []InlineKeyboardButton{
-			{Text: "▶️ 启动", CallbackData: "instance_action:start:" + instanceId},
+			{Text: "▶️ 启动", CallbackData: "instance_action:start:" + instanceIndex},
 		})
 	} else if state == core.InstanceLifecycleStateRunning {
 		actionButtons = append(actionButtons, []InlineKeyboardButton{
-			{Text: "⏹️ 停止", CallbackData: "instance_action:stop:" + instanceId},
-			{Text: "🔄 重启", CallbackData: "instance_action:reboot:" + instanceId},
+			{Text: "⏹️ 停止", CallbackData: "instance_action:stop:" + instanceIndex},
+			{Text: "🔄 重启", CallbackData: "instance_action:reboot:" + instanceIndex},
 		})
 	}
 
 	actionButtons = append(actionButtons, []InlineKeyboardButton{
-		{Text: "💣 终止", CallbackData: "instance_action:terminate:" + instanceId},
-		{Text: " IP 更换", CallbackData: "change_ip:" + instanceId},
+		{Text: "💣 终止", CallbackData: "instance_action:terminate:" + instanceIndex},
+		{Text: " IP 更换", CallbackData: "change_ip:" + instanceIndex},
 	})
 
 	var flexButtons [][]InlineKeyboardButton
 	if strings.Contains(strings.ToLower(*instance.Shape), "flex") {
 		flexButtons = append(flexButtons, []InlineKeyboardButton{
-			{Text: "💪 修改配置", CallbackData: "change_shape_prompt:" + instanceId},
+			{Text: "💪 修改配置", CallbackData: "change_shape_prompt:" + instanceIndex},
 		})
 	}
 	flexButtons = append(flexButtons, []InlineKeyboardButton{
-		{Text: "💾 修改磁盘", CallbackData: "resize_disk_prompt:" + instanceId},
+		{Text: "💾 修改磁盘", CallbackData: "resize_disk_prompt:" + instanceIndex},
 	})
 
 	var allButtonRows [][]InlineKeyboardButton
 	allButtonRows = append(allButtonRows, actionButtons...)
 	allButtonRows = append(allButtonRows, flexButtons...)
 	allButtonRows = append(allButtonRows, []InlineKeyboardButton{
-		{Text: "🔄 刷新", CallbackData: "instance_details:" + instanceId},
+		{Text: "🔄 刷新", CallbackData: "instance_details:" + instanceIndex},
 	})
 	allButtonRows = append(allButtonRows, []InlineKeyboardButton{
 		{Text: "« 返回实例列表", CallbackData: "list_instances_menu"},
@@ -814,7 +839,7 @@ func sendInstanceDetailsKeyboard(chatId string, messageId int, instanceId string
 }
 
 // handleInstanceAction performs an action (start, stop, etc.) on an instance.
-func handleInstanceAction(chatId string, messageId int, instanceId string, actionType string) {
+func handleInstanceAction(chatId string, messageId int, instanceId string, actionType string, instanceIndex string) {
 	chatIdInt, _ := strconv.ParseInt(chatId, 10, 64)
 	mu.RLock()
 	tenantName, ok := selectedTenants[chatIdInt]
@@ -877,11 +902,11 @@ func handleInstanceAction(chatId string, messageId int, instanceId string, actio
 
 	// Refresh details after a short delay
 	time.Sleep(3 * time.Second)
-	sendInstanceDetailsKeyboard(chatId, messageId, instanceId)
+	sendInstanceDetailsKeyboard(chatId, messageId, instanceId, instanceIndex)
 }
 
 // handleChangeIp handles changing the public IP of an instance.
-func handleChangeIp(chatId string, messageId int, instanceId string) {
+func handleChangeIp(chatId string, messageId int, instanceId string, instanceIndex string) {
 	chatIdInt, _ := strconv.ParseInt(chatId, 10, 64)
 	mu.RLock()
 	tenantName, ok := selectedTenants[chatIdInt]
@@ -923,7 +948,7 @@ func handleChangeIp(chatId string, messageId int, instanceId string) {
 
 	// Refresh details after a short delay
 	time.Sleep(3 * time.Second)
-	sendInstanceDetailsKeyboard(chatId, messageId, instanceId)
+	sendInstanceDetailsKeyboard(chatId, messageId, instanceId, instanceIndex)
 }
 
 func sendMainMenuKeyboard(chatId string, messageId int) {
