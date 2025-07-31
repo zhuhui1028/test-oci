@@ -22,9 +22,10 @@
   https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/User/
   监控
   https://docs.oracle.com/en-us/iaas/api/#/en/monitoring/20180401/MetricData/SummarizeMetricsData
-
-  获取可用性域
-  https://docs.oracle.com/en-us/iaas/api/#/en/identity/20160918/AvailabilityDomain/ListAvailabilityDomains
+  用量
+  https://docs.oracle.com/en-us/iaas/api/#/en/usage/20200107/UsageSummary/
+  订阅
+  https://docs.oracle.com/en-us/iaas/api/#/en/onesubscription/20190111/SubscribedService/
 */
 package main
 
@@ -57,6 +58,8 @@ import (
 	"github.com/oracle/oci-go-sdk/v65/example/helpers"
 	"github.com/oracle/oci-go-sdk/v65/identity"
 	"github.com/oracle/oci-go-sdk/v65/monitoring"
+	"github.com/oracle/oci-go-sdk/v65/onesubscription"
+	"github.com/oracle/oci-go-sdk/v65/usageapi"
 	"gopkg.in/ini.v1"
 )
 
@@ -136,12 +139,14 @@ type Result struct {
 
 // OciClients 包含所有必需的OCI服务客户端
 type OciClients struct {
-	Compute    core.ComputeClient
-	Network    core.VirtualNetworkClient
-	Storage    core.BlockstorageClient
-	Identity   identity.IdentityClient
-	Monitoring monitoring.MonitoringClient
-	Provider   common.ConfigurationProvider
+	Compute         core.ComputeClient
+	Network         core.VirtualNetworkClient
+	Storage         core.BlockstorageClient
+	Identity        identity.IdentityClient
+	Monitoring      monitoring.MonitoringClient
+	Usage           usageapi.UsageapiClient
+	Subscription    onesubscription.SubscribedServiceClient
+	Provider        common.ConfigurationProvider
 }
 
 // App 包含应用程序的状态
@@ -579,6 +584,15 @@ func handleCallbackQuery(cb *CallbackQuery) {
 		userNextAction[chatId] = "enter_shape_ocpu:" + instanceId
 		mu.Unlock()
 		editMessage(messageId, chatIdStr, "", "请输入新的OCPU数量 (例如: 4)", nil)
+	case "billing_menu":
+		sendBillingMenuKeyboard(chatIdStr, messageId)
+	case "view_usage":
+		mu.Lock()
+		userNextAction[chatId] = "enter_usage_days"
+		mu.Unlock()
+		editMessage(messageId, chatIdStr, "", "请输入要查询的最近天数 (例如: 30):", nil)
+	case "view_subscriptions":
+		go sendSubscriptionList(chatIdStr, messageId)
 	}
 }
 
@@ -736,6 +750,13 @@ func handleUserInput(msg *TgMessage, action string) {
 				sendMessage(chatIdStr, "", "✅ 实例规格修改成功！", nil)
 			}
 		}()
+	case "enter_usage_days":
+		days, err := strconv.Atoi(msg.Text)
+		if err != nil || days <= 0 {
+			sendMessage(chatIdStr, "", "无效的天数。请输入一个正整数。", nil)
+			return
+		}
+		go sendUsageReport(chatIdStr, msg.MessageId, days)
 	}
 }
 
@@ -976,6 +997,7 @@ func sendTenantMenuKeyboard(chatId, tenantName string, messageId int) {
 		InlineKeyboard: [][]InlineKeyboardButton{
 			{{Text: "⚙️ 创建实例", CallbackData: "create_instance_menu"}},
 			{{Text: "🖥️ 查看实例列表", CallbackData: "list_instances_menu"}},
+			{{Text: "💰 账单和用量", CallbackData: "billing_menu"}},
 			{{Text: "« 返回主菜单", CallbackData: "main_menu"}},
 		},
 	}
@@ -1526,6 +1548,37 @@ func (app *App) initializeClients(oracleSec *ini.Section) error {
 	}
 	clients.Monitoring.HTTPClient = httpClient
 
+	// 新增: 初始化 Usage 和 Subscription 客户端
+	clients.Usage, err = usageapi.NewUsageapiClientWithConfigurationProvider(provider)
+	if err != nil {
+		return fmt.Errorf("创建 UsageapiClient 失败: %w", err)
+	}
+	clients.Usage.HTTPClient = httpClient
+
+	// 修复: 为订阅API创建一个指向正确区域的特定提供程序
+	// onesubscription API 通常托管在 us-ashburn-1
+	content, err := ioutil.ReadFile(app.oracleConfig.Key_file)
+	if err != nil {
+		return err
+	}
+	privateKey := string(content)
+	privateKeyPassphrase := common.String(app.oracleConfig.Key_password)
+
+	subscriptionProvider := common.NewRawConfigurationProvider(
+		app.oracleConfig.Tenancy,
+		app.oracleConfig.User,
+		"us-ashburn-1", // 硬编码到订阅API所在的区域
+		app.oracleConfig.Fingerprint,
+		privateKey,
+		privateKeyPassphrase,
+	)
+
+	clients.Subscription, err = onesubscription.NewSubscribedServiceClientWithConfigurationProvider(subscriptionProvider)
+	if err != nil {
+		return fmt.Errorf("创建 SubscribedServiceClient 失败: %w", err)
+	}
+	clients.Subscription.HTTPClient = httpClient
+
 	app.clients = clients
 
 	fmt.Println("正在获取可用性域...")
@@ -1549,6 +1602,7 @@ func (app *App) showMainMenu() {
 		fmt.Fprintln(w, "5.\t管理员管理")
 		fmt.Fprintln(w, "6.\t租户与用户信息")
 		fmt.Fprintln(w, "7.\t租户管理 (凭证检查)")
+		fmt.Fprintln(w, "8.\t账单和用量") // 新增
 		w.Flush()
 		fmt.Print("\n请输入序号进入相关操作 (输入 'q' 或直接回车返回): ")
 		var input string
@@ -1582,6 +1636,8 @@ func (app *App) showMainMenu() {
 			app.manageTenantAndUser()
 		case 7:
 			app.manageTenants()
+		case 8:
+			app.manageBilling() // 新增
 		default:
 			fmt.Println("\033[1;31m无效的输入。\033[0m")
 		}
@@ -3914,7 +3970,7 @@ func (app *App) checkAllTenantsActivity(botMode bool) string {
 				resultsChan <- TenantStatus{Name: sec.Name(), Status: "无效", Message: "获取Provider失败: " + err.Error()}
 				return
 			}
-			
+
 			httpClient := getOciHttpClient()
 			identityClient, err := identity.NewIdentityClientWithConfigurationProvider(provider)
 			if err != nil {
@@ -3999,4 +4055,347 @@ func (app *App) checkAllTenantsActivity(botMode bool) string {
 		fmt.Scanln()
 		return ""
 	}
+}
+
+// ############# 新增: Billing & Cost Management #############
+
+func (app *App) manageBilling() {
+	for {
+		fmt.Printf("\n\033[1;32m账单和用量管理\033[0m \n(当前账号: %s)\n\n", app.oracleSectionName)
+		fmt.Println("1. 查看成本 (Usage & Cost)")
+		fmt.Println("2. 查看订阅 (Subscriptions)")
+		fmt.Println("3. 查看账户信息 (Account Info)")
+		fmt.Print("请输入序号 (输入 'q' 或直接回车返回): ")
+
+		var input string
+		fmt.Scanln(&input)
+		if input == "" || strings.EqualFold(input, "q") {
+			return
+		}
+
+		num, _ := strconv.Atoi(input)
+		switch num {
+		case 1:
+			app.viewUsage()
+		case 2:
+			app.listSubscriptions()
+		case 3:
+			fmt.Println("此功能暂未实现。")
+		default:
+			fmt.Println("\033[1;31m输入无效\033[0m")
+		}
+	}
+}
+
+func (app *App) viewUsage() {
+	fmt.Print("请输入要查询的开始日期 (YYYY-MM-DD): ")
+	var startDateStr string
+	fmt.Scanln(&startDateStr)
+	parsedStartTime, err := time.Parse("2006-01-02", startDateStr)
+	if err != nil {
+		printlnErr("日期格式错误", "请输入 YYYY-MM-DD 格式")
+		return
+	}
+	// 修复: 截断到当天的开始
+	startTime := time.Date(parsedStartTime.Year(), parsedStartTime.Month(), parsedStartTime.Day(), 0, 0, 0, 0, time.UTC)
+
+	fmt.Print("请输入要查询的结束日期 (YYYY-MM-DD, 默认为今天): ")
+	var endDateStr string
+	fmt.Scanln(&endDateStr)
+	var endTime time.Time
+	if endDateStr == "" {
+		now := time.Now()
+		endTime = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	} else {
+		parsedEndTime, err := time.Parse("2006-01-02", endDateStr)
+		if err != nil {
+			printlnErr("日期格式错误", "请输入 YYYY-MM-DD 格式")
+			return
+		}
+		endTime = time.Date(parsedEndTime.Year(), parsedEndTime.Month(), parsedEndTime.Day(), 0, 0, 0, 0, time.UTC)
+	}
+
+	fmt.Println("正在查询用量数据...")
+	req := usageapi.RequestSummarizedUsagesRequest{
+		RequestSummarizedUsagesDetails: usageapi.RequestSummarizedUsagesDetails{
+			TenantId:          &app.oracleConfig.Tenancy,
+			TimeUsageStarted:  &common.SDKTime{Time: startTime},
+			TimeUsageEnded:    &common.SDKTime{Time: endTime},
+			Granularity:       usageapi.RequestSummarizedUsagesDetailsGranularityDaily,
+			QueryType:         usageapi.RequestSummarizedUsagesDetailsQueryTypeCost,
+			GroupBy:           []string{"service"},
+		},
+	}
+
+	resp, err := app.clients.Usage.RequestSummarizedUsages(ctx, req)
+	if err != nil {
+		printlnErr("查询用量数据失败", err.Error())
+		return
+	}
+
+	if len(resp.Items) == 0 {
+		fmt.Println("在指定时间范围内没有找到用量数据。")
+		return
+	}
+
+	fmt.Printf("\n\033[1;32m成本摘要 (%s - %s)\033[0m\n", startTime.Format("2006-01-02"), endTime.Format("2006-01-02"))
+	w := new(tabwriter.Writer)
+	w.Init(os.Stdout, 0, 8, 2, '\t', 0)
+	fmt.Fprintln(w, "服务\t已计算成本\t已计算用量\t单位")
+	var totalCost float64
+	for _, item := range resp.Items {
+		cost := 0.0
+		if item.ComputedAmount != nil {
+			cost = float64(*item.ComputedAmount) // 修复: float32 -> float64
+			totalCost += cost
+		}
+		quantity := 0.0
+		if item.ComputedQuantity != nil {
+			quantity = float64(*item.ComputedQuantity) // 修复: float32 -> float64
+		}
+		unit := "N/A"
+		if item.Unit != nil {
+			unit = *item.Unit
+		}
+		service := "N/A"
+		if item.Service != nil {
+			service = *item.Service
+		}
+
+		fmt.Fprintf(w, "%s\t%.4f\t%.4f\t%s\n", service, cost, quantity, unit)
+	}
+	w.Flush()
+	fmt.Println("--------------------")
+	fmt.Printf("总成本: %.4f\n", totalCost)
+}
+
+func (app *App) listSubscriptions() {
+	fmt.Println("正在获取订阅信息...")
+
+	// 修复: 添加必需的 SubscriptionId
+	req := onesubscription.ListSubscribedServicesRequest{
+		CompartmentId:  &app.oracleConfig.Tenancy,
+		SubscriptionId: &app.oracleConfig.Tenancy,
+	}
+
+	resp, err := app.clients.Subscription.ListSubscribedServices(ctx, req)
+	if err != nil {
+		printlnErr("获取订阅信息失败", err.Error())
+		return
+	}
+
+	if len(resp.Items) == 0 {
+		fmt.Println("没有找到任何订阅。")
+		return
+	}
+
+	fmt.Printf("\n\033[1;32m订阅列表\033[0m\n")
+	w := new(tabwriter.Writer)
+	w.Init(os.Stdout, 0, 8, 2, '\t', 0)
+	fmt.Fprintln(w, "服务名称\t数量\t状态\t开始时间\t结束时间")
+	for _, sub := range resp.Items {
+		name := "N/A"
+		if sub.Product != nil && sub.Product.Name != nil {
+			name = *sub.Product.Name
+		}
+		quantity := "N/A"
+		if sub.Quantity != nil {
+			quantity = *sub.Quantity
+		}
+		status := "N/A"
+		if sub.Status != nil {
+			status = *sub.Status // 修复: *string -> string
+		}
+		startTime := "N/A"
+		if sub.TimeStart != nil {
+			startTime = sub.TimeStart.Format(timeLayout)
+		}
+		endTime := "N/A"
+		if sub.TimeEnd != nil {
+			endTime = sub.TimeEnd.Format(timeLayout)
+		}
+
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", name, quantity, status, startTime, endTime)
+	}
+	w.Flush()
+}
+
+// --- Bot specific billing functions ---
+
+func sendBillingMenuKeyboard(chatId string, messageId int) {
+	chatIdInt, _ := strconv.ParseInt(chatId, 10, 64) // 修复: 定义 chatIdInt
+	mu.RLock()
+	tenantName, ok := selectedTenants[chatIdInt]
+	mu.RUnlock()
+	if !ok {
+		editMessage(messageId, chatId, "", "错误: 会话已过期，请重新选择租户。", buildMainMenuKeyboard())
+		return
+	}
+
+	text := fmt.Sprintf("当前租户: *%s*\n请选择一个账单操作:", tenantName)
+	keyboard := &InlineKeyboardMarkup{
+		InlineKeyboard: [][]InlineKeyboardButton{
+			{{Text: "📈 查看用量和成本", CallbackData: "view_usage"}},
+			{{Text: "🧾 查看订阅", CallbackData: "view_subscriptions"}},
+			{{Text: "« 返回租户菜单", CallbackData: "tenant_menu"}},
+		},
+	}
+	editMessage(messageId, chatId, "", text, keyboard)
+}
+
+func sendUsageReport(chatId string, messageId int, days int) {
+	chatIdInt, _ := strconv.ParseInt(chatId, 10, 64)
+	mu.RLock()
+	tenantName, ok := selectedTenants[chatIdInt]
+	mu.RUnlock()
+	if !ok {
+		editMessage(messageId, chatId, "", "错误: 会话已过期，请重新选择租户。", buildMainMenuKeyboard())
+		return
+	}
+
+	editMessage(messageId, chatId, "", fmt.Sprintf("正在为租户 *%s* 查询过去 *%d* 天的用量数据...", tenantName, days), nil)
+
+	app := &App{}
+	app.loadOracleSections(cfg)
+	var targetSection *ini.Section
+	for _, sec := range app.oracleSections {
+		if sec.Name() == tenantName {
+			targetSection = sec
+			break
+		}
+	}
+	if err := app.initializeClients(targetSection); err != nil {
+		editMessage(messageId, chatId, "", "错误: 初始化客户端失败: "+err.Error(), nil)
+		return
+	}
+
+	now := time.Now()
+	endTime := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	startTime := endTime.AddDate(0, 0, -days)
+
+	req := usageapi.RequestSummarizedUsagesRequest{
+		RequestSummarizedUsagesDetails: usageapi.RequestSummarizedUsagesDetails{
+			TenantId:         &app.oracleConfig.Tenancy,
+			TimeUsageStarted: &common.SDKTime{Time: startTime},
+			TimeUsageEnded:   &common.SDKTime{Time: endTime},
+			Granularity:      usageapi.RequestSummarizedUsagesDetailsGranularityDaily,
+			QueryType:        usageapi.RequestSummarizedUsagesDetailsQueryTypeCost,
+			GroupBy:          []string{"service"},
+		},
+	}
+
+	resp, err := app.clients.Usage.RequestSummarizedUsages(ctx, req)
+	if err != nil {
+		editMessage(messageId, chatId, "", "❌ 查询用量数据失败: "+err.Error(), buildBillingMenuKeyboard(chatId))
+		return
+	}
+
+	if len(resp.Items) == 0 {
+		editMessage(messageId, chatId, "", "在指定时间范围内没有找到用量数据。", buildBillingMenuKeyboard(chatId))
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("*成本摘要 (%s - %s)*\n", startTime.Format("2006-01-02"), endTime.Format("2006-01-02")))
+	sb.WriteString("```\n")
+	w := new(tabwriter.Writer)
+	w.Init(&sb, 0, 8, 1, ' ', tabwriter.Debug)
+	fmt.Fprintln(w, "服务\t | 成本\t | 货币")
+	fmt.Fprintln(w, "----------------\t | ------\t | ------")
+	var totalCost float64
+	currency := ""
+	for _, item := range resp.Items {
+		cost := 0.0
+		if item.ComputedAmount != nil {
+			cost = float64(*item.ComputedAmount) // 修复: float32 -> float64
+			totalCost += cost
+		}
+		if item.Currency != nil && currency == "" {
+			currency = *item.Currency
+		}
+		service := "N/A"
+		if item.Service != nil {
+			service = *item.Service
+		}
+		fmt.Fprintf(w, "%s\t | %.2f\t | %s\n", service, cost, currency)
+	}
+	w.Flush()
+	sb.WriteString("--------------------------------\n")
+	sb.WriteString(fmt.Sprintf("总计\t | %.2f\t | %s\n", totalCost, currency))
+	sb.WriteString("```")
+
+	editMessage(messageId, chatId, "", sb.String(), buildBillingMenuKeyboard(chatId))
+}
+
+func sendSubscriptionList(chatId string, messageId int) {
+	chatIdInt, _ := strconv.ParseInt(chatId, 10, 64)
+	mu.RLock()
+	tenantName, ok := selectedTenants[chatIdInt]
+	mu.RUnlock()
+	if !ok {
+		editMessage(messageId, chatId, "", "错误: 会话已过期，请重新选择租户。", buildMainMenuKeyboard())
+		return
+	}
+
+	editMessage(messageId, chatId, "", fmt.Sprintf("正在为租户 *%s* 获取订阅信息...", tenantName), nil)
+
+	app := &App{}
+	app.loadOracleSections(cfg)
+	var targetSection *ini.Section
+	for _, sec := range app.oracleSections {
+		if sec.Name() == tenantName {
+			targetSection = sec
+			break
+		}
+	}
+	if err := app.initializeClients(targetSection); err != nil {
+		editMessage(messageId, chatId, "", "错误: 初始化客户端失败: "+err.Error(), nil)
+		return
+	}
+
+	req := onesubscription.ListSubscribedServicesRequest{
+		CompartmentId:  &app.oracleConfig.Tenancy,
+		SubscriptionId: &app.oracleConfig.Tenancy, // 修复: 添加必需的 SubscriptionId
+	}
+
+	resp, err := app.clients.Subscription.ListSubscribedServices(ctx, req)
+	if err != nil {
+		editMessage(messageId, chatId, "", "❌ 获取订阅信息失败: "+err.Error(), buildBillingMenuKeyboard(chatId))
+		return
+	}
+
+	if len(resp.Items) == 0 {
+		editMessage(messageId, chatId, "", "没有找到任何订阅。", buildBillingMenuKeyboard(chatId))
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString("*订阅列表*\n")
+	for _, sub := range resp.Items {
+		name := "N/A"
+		if sub.Product != nil && sub.Product.Name != nil {
+			name = *sub.Product.Name
+		}
+		status := "N/A"
+		if sub.Status != nil {
+			status = *sub.Status // 修复: *string -> string
+		}
+		endTime := "N/A"
+		if sub.TimeEnd != nil {
+			endTime = sub.TimeEnd.Format("2006-01-02")
+		}
+		sb.WriteString(fmt.Sprintf("\n- *%s*\n  状态: %s\n  到期: %s\n", name, status, endTime))
+	}
+
+	editMessage(messageId, chatId, "", sb.String(), buildBillingMenuKeyboard(chatId))
+}
+
+func buildBillingMenuKeyboard(chatId string) *InlineKeyboardMarkup {
+        return &InlineKeyboardMarkup{
+                InlineKeyboard: [][]InlineKeyboardButton{
+                        {{Text: "📈  查看用量和成本", CallbackData: "view_usage"}},
+                        {{Text: "🧾  查看订阅", CallbackData: "view_subscriptions"}},
+                        {{Text: "« 返回租户菜单", CallbackData: "tenant_menu"}},
+                },
+        }
 }
